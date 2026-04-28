@@ -9,80 +9,33 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  buildFilesByFolder,
+  buildFolderTree,
+  buildVisibleTreeEntries,
+  filterMediaItems,
+  findMediaById,
+  findMediaByPath,
+  parentFolderPath,
+  sortMediaItems,
+  type ExplorerSelection,
+  type FolderTreeNode,
+  type MediaItem,
+  type MediaKind,
+  type ScanResult,
+  type SortKey,
+  type TreeVisibleEntry,
+} from "./lib/media-browser";
 
-type MediaKind = "image" | "video";
-type SortKey = "name" | "date" | "size";
-type PaneKey = "folders" | "files" | "preview";
-type TreeVisibleEntry =
-  | {
-      type: "folder";
-      key: string;
-      path: string;
-      depth: number;
-      canExpand: boolean;
-      isExpanded: boolean;
-    }
-  | {
-      type: "file";
-      key: string;
-      id: string;
-      path: string;
-      parentPath: string;
-      depth: number;
-    };
+type PaneKey = "folders" | "preview";
 
-type ExplorerSelection =
-  | {
-      type: "folder";
-      path: string;
-    }
-  | {
-      type: "file";
-      id: string;
-      parentPath: string;
-    };
-
-type MediaItem = {
-  id: string;
-  kind: MediaKind;
-  name: string;
-  path: string;
-  relativePath: string;
-  ext: string;
-  sizeBytes: number;
-  modifiedMs: number;
-};
-
-type ScanResult = {
-  rootPath: string;
-  rootName: string;
-  items: MediaItem[];
-};
-
-type FolderTreeNode = {
-  path: string;
-  name: string;
-  depth: number;
-  itemCount: number;
-  coverPath: string | null;
-  children: string[];
-};
-
-const LIST_OVERSCAN = 6;
-const LIST_ITEM_HEIGHT = 62;
 const IMAGE_ZOOM_MIN = 0.5;
 const IMAGE_ZOOM_MAX = 6;
 const IMAGE_ZOOM_STEP = 0.2;
+const LIST_ITEM_HEIGHT = 62;
 const DEFAULT_FOLDER_WIDTH = 276;
-const DEFAULT_FILE_WIDTH = 360;
 const MIN_FOLDER_WIDTH = 220;
 const MAX_FOLDER_WIDTH = 460;
-const MIN_FILE_WIDTH = 280;
-const MAX_FILE_WIDTH = 680;
-const NATURAL_NAME_COLLATOR = new Intl.Collator(undefined, {
-  numeric: true,
-  sensitivity: "base",
-});
 
 function formatBytes(bytes: number) {
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -109,69 +62,6 @@ function assetUrl(path: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
-}
-
-function parentFolderPath(relativePath: string) {
-  const slashIndex = relativePath.lastIndexOf("/");
-  return slashIndex >= 0 ? relativePath.slice(0, slashIndex) : "";
-}
-
-function folderLabel(path: string, fallback: string) {
-  if (!path) return fallback;
-  const segments = path.split("/");
-  return segments[segments.length - 1] || fallback;
-}
-
-function compareNaturalText(a: string, b: string) {
-  return NATURAL_NAME_COLLATOR.compare(a, b);
-}
-
-function buildVisibleTreeEntries(
-  nodePath: string,
-  nodes: Map<string, FolderTreeNode>,
-  expandedPaths: Set<string>,
-  folderFiles: Map<string, MediaItem[]>,
-  depth = 0,
-): TreeVisibleEntry[] {
-  const node = nodes.get(nodePath);
-  if (!node) return [];
-
-  const files = folderFiles.get(node.path) ?? [];
-  const canExpand = node.children.length > 0 || files.length > 0;
-  const isExpanded = expandedPaths.has(node.path);
-  const entries: TreeVisibleEntry[] = [
-    {
-      type: "folder",
-      key: `folder:${node.path}`,
-      path: node.path,
-      depth,
-      canExpand,
-      isExpanded,
-    },
-  ];
-
-  if (!isExpanded) {
-    return entries;
-  }
-
-  for (const file of files) {
-    entries.push({
-      type: "file",
-      key: `file:${file.id}`,
-      id: file.id,
-      path: file.path,
-      parentPath: node.path,
-      depth: depth + 1,
-    });
-  }
-
-  for (const childPath of node.children) {
-    entries.push(
-      ...buildVisibleTreeEntries(childPath, nodes, expandedPaths, folderFiles, depth + 1),
-    );
-  }
-
-  return entries;
 }
 
 const VideoThumb = memo(function VideoThumb({
@@ -466,18 +356,14 @@ function App() {
   const [infoOpen, setInfoOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [showFolders, setShowFolders] = useState(true);
-  const [showFiles, setShowFiles] = useState(false);
   const [showPreview, setShowPreview] = useState(true);
   const [folderWidth, setFolderWidth] = useState(DEFAULT_FOLDER_WIDTH);
-  const [fileWidth, setFileWidth] = useState(DEFAULT_FILE_WIDTH);
   const [expandedFolderPaths, setExpandedFolderPaths] = useState<Set<string>>(new Set([""]));
   const [selectedFolderPath, setSelectedFolderPath] = useState("");
   const [explorerSelection, setExplorerSelection] = useState<ExplorerSelection>({
     type: "folder",
     path: "",
   });
-  const [scrollTop, setScrollTop] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(0);
   const [imageZoom, setImageZoom] = useState(1);
   const [imageOffset, setImageOffset] = useState({ x: 0, y: 0 });
   const [isDraggingImage, setIsDraggingImage] = useState(false);
@@ -486,7 +372,6 @@ function App() {
     y: number;
     itemId: string;
   } | null>(null);
-  const listRef = useRef<HTMLDivElement | null>(null);
   const explorerRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{
     startX: number;
@@ -495,7 +380,6 @@ function App() {
     originY: number;
   } | null>(null);
   const resizeStateRef = useRef<{
-    pane: "folders" | "files";
     startX: number;
     startWidth: number;
   } | null>(null);
@@ -507,78 +391,10 @@ function App() {
     [items, kindFilter],
   );
 
-  const folderTree = useMemo(() => {
-    const nodes = new Map<string, FolderTreeNode>();
-    nodes.set("", {
-      path: "",
-      name: rootFolderName || "Root",
-      depth: 0,
-      itemCount: 0,
-      coverPath: null,
-      children: [],
-    });
-
-    for (const item of treeSourceItems) {
-      const parentPath = parentFolderPath(item.relativePath);
-      const segments = parentPath ? parentPath.split("/") : [];
-      let currentPath = "";
-
-      nodes.get("")!.itemCount += 1;
-
-      for (const segment of segments) {
-        const nextPath = currentPath ? `${currentPath}/${segment}` : segment;
-        if (!nodes.has(nextPath)) {
-          nodes.set(nextPath, {
-            path: nextPath,
-            name: segment,
-            depth: nextPath.split("/").length,
-            itemCount: 0,
-            coverPath: null,
-            children: [],
-          });
-        }
-
-        const parentNode = nodes.get(currentPath);
-        if (parentNode && !parentNode.children.includes(nextPath)) {
-          parentNode.children.push(nextPath);
-        }
-
-        nodes.get(nextPath)!.itemCount += 1;
-        currentPath = nextPath;
-      }
-
-      if (
-        item.kind === "image" &&
-        !parentPath &&
-        rootFolderName &&
-        !nodes.get("")?.coverPath &&
-        item.name.toLowerCase() === rootFolderName.toLowerCase()
-      ) {
-        nodes.get("")!.coverPath = item.path;
-      }
-
-      if (item.kind === "image" && parentPath) {
-        const folderNode = nodes.get(parentPath);
-        if (
-          folderNode &&
-          !folderNode.coverPath &&
-          item.name.toLowerCase() === folderNode.name.toLowerCase()
-        ) {
-          folderNode.coverPath = item.path;
-        }
-      }
-    }
-
-    for (const node of nodes.values()) {
-      node.children.sort((a, b) => {
-        const aNode = nodes.get(a);
-        const bNode = nodes.get(b);
-        return (aNode?.name ?? "").localeCompare(bNode?.name ?? "");
-      });
-    }
-
-    return nodes;
-  }, [rootFolderName, treeSourceItems]);
+  const folderTree = useMemo(
+    () => buildFolderTree(rootFolderName, treeSourceItems),
+    [rootFolderName, treeSourceItems],
+  );
 
   const selectedFolderNode = folderTree.get(selectedFolderPath) ?? folderTree.get("");
 
@@ -591,96 +407,44 @@ function App() {
       return;
     }
 
-    const coverItem = items.find((item) => item.path === node.coverPath) ?? null;
+    const coverItem = findMediaByPath(items, node.coverPath);
     setActiveId(coverItem?.id ?? null);
   }
 
-  const filtered = useMemo(() => {
-    const normalizedQuery = deferredQuery.trim().toLowerCase();
-    return items
-      .filter((item) =>
-        selectedFolderPath ? item.relativePath.startsWith(`${selectedFolderPath}/`) : true,
-      )
-      .filter((item) => (kindFilter === "all" ? true : item.kind === kindFilter))
-      .filter((item) => {
-        if (!normalizedQuery) return true;
-        return (
-          item.name.toLowerCase().includes(normalizedQuery) ||
-          item.relativePath.toLowerCase().includes(normalizedQuery)
-        );
-      });
-  }, [items, selectedFolderPath, kindFilter, deferredQuery]);
-
-  const treeFilteredItems = useMemo(() => {
-    const normalizedQuery = deferredQuery.trim().toLowerCase();
-    return items
-      .filter((item) => (kindFilter === "all" ? true : item.kind === kindFilter))
-      .filter((item) => {
-        if (!normalizedQuery) return true;
-        return (
-          item.name.toLowerCase().includes(normalizedQuery) ||
-          item.relativePath.toLowerCase().includes(normalizedQuery)
-        );
-      });
-  }, [items, kindFilter, deferredQuery]);
-
-  const sorted = useMemo(() => {
-    const next = [...filtered];
-    next.sort((a, b) => {
-      switch (sortKey) {
-        case "name":
-          return compareNaturalText(a.name, b.name) || compareNaturalText(a.ext, b.ext);
-        case "size":
-          return b.sizeBytes - a.sizeBytes;
-        case "date":
-        default:
-          return b.modifiedMs - a.modifiedMs;
-      }
-    });
-    return next;
-  }, [filtered, sortKey]);
-
-  const sortedTreeItems = useMemo(() => {
-    const next = [...treeFilteredItems];
-    next.sort((a, b) => {
-      switch (sortKey) {
-        case "name":
-          return compareNaturalText(a.name, b.name) || compareNaturalText(a.ext, b.ext);
-        case "size":
-          return b.sizeBytes - a.sizeBytes;
-        case "date":
-        default:
-          return b.modifiedMs - a.modifiedMs;
-      }
-    });
-    return next;
-  }, [treeFilteredItems, sortKey]);
-
-  const filesByFolder = useMemo(() => {
-    const next = new Map<string, MediaItem[]>();
-    for (const item of sortedTreeItems) {
-      const folderPath = parentFolderPath(item.relativePath);
-      const bucket = next.get(folderPath) ?? [];
-      bucket.push(item);
-      next.set(folderPath, bucket);
-    }
-    return next;
-  }, [sortedTreeItems]);
-
-  const active = useMemo(
-    () => (activeId ? items.find((item) => item.id === activeId) ?? null : null),
-    [items, activeId],
+  const filtered = useMemo(
+    () =>
+      filterMediaItems(items, {
+        folderPath: selectedFolderPath,
+        kindFilter,
+        query: deferredQuery,
+      }),
+    [deferredQuery, items, kindFilter, selectedFolderPath],
   );
+
+  const treeFilteredItems = useMemo(
+    () =>
+      filterMediaItems(items, {
+        kindFilter,
+        query: deferredQuery,
+      }),
+    [deferredQuery, items, kindFilter],
+  );
+
+  const sorted = useMemo(() => sortMediaItems(filtered, sortKey), [filtered, sortKey]);
+  const sortedTreeItems = useMemo(
+    () => sortMediaItems(treeFilteredItems, sortKey),
+    [sortKey, treeFilteredItems],
+  );
+
+  const filesByFolder = useMemo(() => buildFilesByFolder(sortedTreeItems), [sortedTreeItems]);
+
+  const active = useMemo(() => findMediaById(items, activeId), [items, activeId]);
   const activeName = active ? active.name + active.ext : "Select a file";
   const activeLocation = active
     ? active.relativePath
     : selectedFolderPath
       ? `Showing ${selectedFolderPath}`
       : "Choose a folder to start browsing.";
-  const currentFolderLabel = selectedFolderPath
-    ? folderLabel(selectedFolderPath, rootFolderName || "Root")
-    : rootFolderName || "Root";
-
   const previewSourceUrl = useMemo(
     () => (active ? assetUrl(active.path) : ""),
     [active?.path],
@@ -693,36 +457,6 @@ function App() {
   useEffect(() => {
     setContextMenu(null);
   }, [active?.id, deferredQuery, kindFilter, selectedFolderPath, sortKey]);
-
-  useEffect(() => {
-    const node = listRef.current;
-    if (!node) return;
-
-    const updateHeight = () => setViewportHeight(node.clientHeight);
-    updateHeight();
-
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const node = listRef.current;
-    if (!node || !activeId) return;
-    const index = sorted.findIndex((item) => item.id === activeId);
-    if (index < 0) return;
-
-    const top = index * LIST_ITEM_HEIGHT;
-    const bottom = top + LIST_ITEM_HEIGHT;
-    const viewTop = node.scrollTop;
-    const viewBottom = viewTop + node.clientHeight;
-
-    if (top < viewTop) {
-      node.scrollTo({ top });
-    } else if (bottom > viewBottom) {
-      node.scrollTo({ top: bottom - node.clientHeight });
-    }
-  }, [activeId, sorted]);
 
   useEffect(() => {
     if (!viewerExpanded || active?.kind !== "image") {
@@ -739,16 +473,6 @@ function App() {
     setExpandedFolderPaths(new Set([""]));
   }, [rootPath]);
 
-  useEffect(() => {
-    if (!sorted.length) {
-      setActiveId(null);
-      return;
-    }
-    if (showFiles && (!activeId || !sorted.some((item) => item.id === activeId))) {
-      setActiveId(sorted[0].id);
-    }
-  }, [activeId, showFiles, sorted]);
-
   async function loadFolder(root: string, preferredPath?: string | null) {
     setIsLoading(true);
     setErrorMessage("");
@@ -763,13 +487,9 @@ function App() {
       setSelectedFolderPath("");
       setExplorerSelection({ type: "folder", path: "" });
 
-      const preferred = preferredPath
-        ? result.items.find((item) => item.path === preferredPath)
-        : null;
+      const preferred = findMediaByPath(result.items, preferredPath ?? null);
       const fallback =
-        activeId && !preferredPath
-          ? result.items.find((item) => item.id === activeId)
-          : null;
+        activeId && !preferredPath ? findMediaById(result.items, activeId) : null;
       setActiveId(preferred?.id ?? fallback?.id ?? result.items[0]?.id ?? null);
     } catch (error) {
       setErrorMessage(
@@ -878,6 +598,13 @@ function App() {
   }
 
   function openRenameForItem(item: MediaItem) {
+    const parentPath = parentFolderPath(item.relativePath);
+    setSelectedFolderPath(parentPath);
+    setExplorerSelection({
+      type: "file",
+      id: item.id,
+      parentPath,
+    });
     setActiveId(item.id);
     setRenameValue(item.name);
     setRenameOpen(true);
@@ -919,44 +646,41 @@ function App() {
   function togglePane(pane: PaneKey) {
     const next = {
       folders: showFolders,
-      files: showFiles,
       preview: showPreview,
-      [pane]: !(
-        pane === "folders" ? showFolders : pane === "files" ? showFiles : showPreview
-      ),
+      [pane]: !(pane === "folders" ? showFolders : showPreview),
     };
 
-    if (!next.folders && !next.files && !next.preview) {
+    if (!next.folders && !next.preview) {
       return;
     }
 
     setShowFolders(next.folders);
-    setShowFiles(next.files);
     setShowPreview(next.preview);
   }
 
   function resetLayout() {
     setShowFolders(true);
-    setShowFiles(false);
     setShowPreview(true);
     setFolderWidth(DEFAULT_FOLDER_WIDTH);
-    setFileWidth(DEFAULT_FILE_WIDTH);
   }
 
-  function startResize(
-    pane: "folders" | "files",
-    event: ReactMouseEvent<HTMLDivElement>,
-  ) {
+  function startResize(event: ReactMouseEvent<HTMLDivElement>) {
     event.preventDefault();
     resizeStateRef.current = {
-      pane,
       startX: event.clientX,
-      startWidth: pane === "folders" ? folderWidth : fileWidth,
+      startWidth: folderWidth,
     };
   }
 
   function handleRowContextMenu(event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) {
     event.preventDefault();
+    const parentPath = parentFolderPath(item.relativePath);
+    setSelectedFolderPath(parentPath);
+    setExplorerSelection({
+      type: "file",
+      id: item.id,
+      parentPath,
+    });
     setActiveId(item.id);
     setContextMenu({
       x: event.clientX,
@@ -1199,12 +923,7 @@ function App() {
       if (!state) return;
 
       const deltaX = event.clientX - state.startX;
-      if (state.pane === "folders") {
-        setFolderWidth(clamp(state.startWidth + deltaX, MIN_FOLDER_WIDTH, MAX_FOLDER_WIDTH));
-        return;
-      }
-
-      setFileWidth(clamp(state.startWidth + deltaX, MIN_FILE_WIDTH, MAX_FILE_WIDTH));
+      setFolderWidth(clamp(state.startWidth + deltaX, MIN_FOLDER_WIDTH, MAX_FOLDER_WIDTH));
     }
 
     function onMouseUp() {
@@ -1217,7 +936,7 @@ function App() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [folderWidth, fileWidth]);
+  }, [folderWidth]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -1236,13 +955,8 @@ function App() {
     };
   }, [contextMenu]);
 
-  const totalHeight = sorted.length * LIST_ITEM_HEIGHT;
-  const startIndex = Math.max(0, Math.floor(scrollTop / LIST_ITEM_HEIGHT) - LIST_OVERSCAN);
-  const visibleCount = Math.ceil((viewportHeight || 0) / LIST_ITEM_HEIGHT) + LIST_OVERSCAN * 2;
-  const endIndex = Math.min(sorted.length, startIndex + visibleCount);
-  const visibleItems = sorted.slice(startIndex, endIndex);
   const contextMenuItem = contextMenu
-    ? sorted.find((item) => item.id === contextMenu.itemId) ?? null
+    ? findMediaById(items, contextMenu.itemId)
     : null;
   const selectedExplorerKey =
     explorerSelection.type === "file"
@@ -1412,117 +1126,12 @@ function App() {
         </aside>
         ) : null}
 
-        {showFolders && (showFiles || showPreview) ? (
+        {showFolders && showPreview ? (
           <div
             role="separator"
             aria-orientation="vertical"
             className="group relative -ml-1 mr-[-1px] w-2 shrink-0 cursor-col-resize bg-transparent"
-            onMouseDown={(event) => startResize("folders", event)}
-          >
-            <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-zinc-800/80 transition group-hover:bg-zinc-500" />
-          </div>
-        ) : null}
-
-        {showFiles ? (
-        <section
-          className="flex min-h-0 shrink-0 flex-col border-r border-zinc-200 bg-[#101015] dark:border-zinc-800"
-          style={{ width: showPreview ? `${fileWidth}px` : undefined, flex: showPreview ? undefined : 1 }}
-        >
-          <div className="border-b border-zinc-200 px-3 py-2.5 dark:border-zinc-800">
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-[9px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">
-                  Files
-                </div>
-                <div className="mt-1 truncate text-[14px] font-semibold">
-                  {currentFolderLabel}
-                </div>
-              </div>
-              <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
-                {sorted.length}
-              </div>
-            </div>
-            <div className="mt-1.5 text-[9px] text-zinc-500 dark:text-zinc-400">
-              Tree for browsing, list for bulk scanning.
-            </div>
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search files"
-              className="mt-2.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[12px] outline-none placeholder:text-zinc-500 focus:border-zinc-600"
-            />
-            <div className="mt-2.5 flex items-center gap-2">
-              {(
-                [
-                  ["all", "All"],
-                  ["image", "Images"],
-                  ["video", "Videos"],
-                ] as const
-              ).map(([key, label]) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setKindFilter(key)}
-                  className={classNames(
-                    "rounded-md px-2.5 py-1 text-[10px]",
-                    kindFilter === key
-                      ? "bg-white text-zinc-950"
-                      : "border border-zinc-800 bg-zinc-950 hover:bg-zinc-900",
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-
-              <select
-                className="ml-auto rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
-                value={sortKey}
-                onChange={(event) => setSortKey(event.target.value as SortKey)}
-              >
-                <option value="date">Date</option>
-                <option value="name">Name</option>
-                <option value="size">Size</option>
-              </select>
-            </div>
-          </div>
-          <div
-            ref={listRef}
-            className="min-h-0 flex-1 overflow-auto p-1.5"
-            onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
-          >
-            <div className="relative" style={{ height: `${totalHeight}px` }}>
-              {visibleItems.map((item, index) => {
-                const actualIndex = startIndex + index;
-                return (
-                  <div
-                    key={item.id}
-                    className="absolute left-0 right-0"
-                    style={{
-                      top: `${actualIndex * LIST_ITEM_HEIGHT}px`,
-                      height: `${LIST_ITEM_HEIGHT}px`,
-                    }}
-                  >
-                    <MediaListRow
-                      item={item}
-                      isActive={item.id === active?.id}
-                      itemHeight={LIST_ITEM_HEIGHT}
-                      onSelect={setActiveId}
-                      onContextMenu={handleRowContextMenu}
-                    />
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </section>
-        ) : null}
-
-        {showFiles && showPreview ? (
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            className="group relative -ml-1 mr-[-1px] w-2 shrink-0 cursor-col-resize bg-transparent"
-            onMouseDown={(event) => startResize("files", event)}
+            onMouseDown={startResize}
           >
             <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-zinc-800/80 transition group-hover:bg-zinc-500" />
           </div>
