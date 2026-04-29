@@ -120,17 +120,31 @@ function resolveVideoVrLayout(
 }
 
 function videoVrTransformStyle(
-  enabled: boolean,
+  mode: VideoEyeMode,
   layout: VideoVrLayout,
 ): CSSProperties | undefined {
-  if (!enabled) {
+  if (mode === "standard") {
     return undefined;
   }
 
   if (layout === "ou") {
+    if (mode === "right") {
+      return {
+        transform: "translateY(-100%) scaleY(2)",
+        transformOrigin: "center top",
+      };
+    }
+
     return {
       transform: "scaleY(2)",
       transformOrigin: "center top",
+    };
+  }
+
+  if (mode === "right") {
+    return {
+      transform: "translateX(-100%) scaleX(2)",
+      transformOrigin: "left center",
     };
   }
 
@@ -191,6 +205,7 @@ type AnimationExportFormat = "gif" | "webp";
 type ContextSubmenu = "background-remove" | "extract-frames" | null;
 type VideoVrLayout = "sbs" | "ou";
 type VideoVrLayoutSetting = "auto" | VideoVrLayout;
+type VideoEyeMode = "standard" | "left" | "right";
 type ContextMenuState =
   | { x: number; y: number; target: "item"; itemId: string }
   | { x: number; y: number; target: "folder"; folderPath: string };
@@ -510,7 +525,7 @@ function App() {
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [videoMuted, setVideoMuted] = useState(true);
-  const [videoVrEnabled, setVideoVrEnabled] = useState(false);
+  const [videoEyeMode, setVideoEyeMode] = useState<VideoEyeMode>("standard");
   const [videoVrLayoutSetting, setVideoVrLayoutSetting] =
     useState<VideoVrLayoutSetting>("auto");
   const [activeVideoDimensions, setActiveVideoDimensions] = useState<{
@@ -676,7 +691,7 @@ function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    setVideoVrEnabled(false);
+    setVideoEyeMode("standard");
     setVideoVrLayoutSetting("auto");
     setActiveVideoDimensions(null);
   }, [active?.id, active?.kind]);
@@ -1493,7 +1508,7 @@ function App() {
           muted={videoMuted}
           preload="metadata"
           onLoadedMetadata={handleVideoMetadata}
-          style={videoVrTransformStyle(videoVrEnabled, resolvedVideoVrLayout)}
+          style={videoVrTransformStyle(videoEyeMode, resolvedVideoVrLayout)}
         />
       </div>
     );
@@ -1980,24 +1995,33 @@ function App() {
                   </div>
                   {active.kind === "video" ? (
                     <>
-                      <button
-                        type="button"
-                        onClick={() => setVideoVrEnabled((value) => !value)}
-                        className={classNames(
-                          "rounded-full border px-2.5 py-1 text-[10px]",
-                          videoVrEnabled
-                            ? "border-sky-700 bg-sky-950/70 text-sky-100"
-                            : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
-                        )}
-                      >
-                        VR {videoVrEnabled ? "On" : "Off"}
-                      </button>
+                      {(
+                        [
+                          ["standard", "Standard"],
+                          ["left", "Left Eye"],
+                          ["right", "Right Eye"],
+                        ] as const
+                      ).map(([mode, label]) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() => setVideoEyeMode(mode)}
+                          className={classNames(
+                            "rounded-full border px-2.5 py-1 text-[10px]",
+                            videoEyeMode === mode
+                              ? "border-sky-700 bg-sky-950/70 text-sky-100"
+                              : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
+                          )}
+                        >
+                          {label}
+                        </button>
+                      ))}
                       <button
                         type="button"
                         onClick={cycleVideoVrLayout}
                         className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
                       >
-                        Mode {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
+                        Layout {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
                       </button>
                     </>
                   ) : null}
@@ -2654,24 +2678,33 @@ function App() {
                 ) : null}
                 {active.kind === "video" ? (
                   <>
-                    <button
-                      className={classNames(
-                        "rounded-md border px-3 py-1.5 text-xs",
-                        videoVrEnabled
-                          ? "border-sky-700 bg-sky-950/70 text-sky-100 hover:bg-sky-900/70"
-                          : "border-zinc-700 bg-zinc-900 hover:bg-zinc-800",
-                      )}
-                      type="button"
-                      onClick={() => setVideoVrEnabled((value) => !value)}
-                    >
-                      VR {videoVrEnabled ? "On" : "Off"}
-                    </button>
+                    {(
+                      [
+                        ["standard", "Standard"],
+                        ["left", "Left Eye"],
+                        ["right", "Right Eye"],
+                      ] as const
+                    ).map(([mode, label]) => (
+                      <button
+                        key={mode}
+                        className={classNames(
+                          "rounded-md border px-3 py-1.5 text-xs",
+                          videoEyeMode === mode
+                            ? "border-sky-700 bg-sky-950/70 text-sky-100 hover:bg-sky-900/70"
+                            : "border-zinc-700 bg-zinc-900 hover:bg-zinc-800",
+                        )}
+                        type="button"
+                        onClick={() => setVideoEyeMode(mode)}
+                      >
+                        {label}
+                      </button>
+                    ))}
                     <button
                       className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
                       type="button"
                       onClick={cycleVideoVrLayout}
                     >
-                      Mode {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
+                      Layout {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
                     </button>
                     <button
                       className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
