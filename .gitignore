@@ -12,6 +12,7 @@ node_modules
 dist
 dist-ssr
 *.local
+src-tauri/.rembg-venv/
 
 # Editor directories and files
 .vscode/*

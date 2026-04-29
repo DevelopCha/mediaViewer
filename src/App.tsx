@@ -1,10 +1,12 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   memo,
   type MouseEvent as ReactMouseEvent,
   type WheelEvent as ReactWheelEvent,
   useDeferredValue,
   useEffect,
+  useEffectEvent,
   useMemo,
   useRef,
   useState,
@@ -28,6 +30,24 @@ import {
 } from "./lib/media-browser";
 
 type PaneKey = "folders" | "preview";
+type BackgroundTaskStatus = "queued" | "running" | "completed" | "failed";
+
+type BackgroundTask = {
+  id: string;
+  kind: string;
+  engineKey: string;
+  engineLabel: string;
+  sourcePath: string;
+  outputPath: string;
+  fileName: string;
+  status: BackgroundTaskStatus;
+  progress: number;
+  message: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+  error: string | null;
+  warning?: string | null;
+};
 
 const IMAGE_ZOOM_MIN = 0.5;
 const IMAGE_ZOOM_MAX = 6;
@@ -63,6 +83,58 @@ function assetUrl(path: string) {
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
+
+function upsertBackgroundTask(tasks: BackgroundTask[], task: BackgroundTask) {
+  const existingIndex = tasks.findIndex((candidate) => candidate.id === task.id);
+  if (existingIndex < 0) {
+    return [task, ...tasks];
+  }
+
+  const next = [...tasks];
+  next[existingIndex] = task;
+  return next.sort((a, b) => b.createdAtMs - a.createdAtMs);
+}
+
+function backgroundTaskLabel(status: BackgroundTaskStatus) {
+  switch (status) {
+    case "queued":
+      return "Queued";
+    case "running":
+      return "Running";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    default:
+      return status;
+  }
+}
+
+function backgroundTaskProgressLabel(task: BackgroundTask) {
+  if (task.status === "queued") {
+    return "Waiting";
+  }
+  if (task.status === "running") {
+    return "In progress";
+  }
+  if (task.status === "failed") {
+    return "Failed";
+  }
+  return `${task.progress}%`;
+}
+
+type BackgroundEngineKey = "anime" | "real" | "bria" | "withoutbg";
+type ContextSubmenu = "background-remove" | null;
+
+const BACKGROUND_ENGINES: Array<{
+  key: BackgroundEngineKey;
+  label: string;
+}> = [
+  { key: "anime", label: "ISNet Anime (Anime)" },
+  { key: "real", label: "ISNet General (Real)" },
+  { key: "bria", label: "BRIA RMBG (Real)" },
+  { key: "withoutbg", label: "withoutBG (HQ)" },
+];
 
 const VideoThumb = memo(function VideoThumb({
   path,
@@ -125,25 +197,29 @@ const VideoThumb = memo(function VideoThumb({
 const MediaListRow = memo(function MediaListRow({
   item,
   isActive,
+  isSelected,
   itemHeight,
   onSelect,
   onContextMenu,
 }: {
   item: MediaItem;
   isActive: boolean;
+  isSelected: boolean;
   itemHeight: number;
-  onSelect: (id: string) => void;
+  onSelect: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
   onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
 }) {
   return (
     <button
       type="button"
-      onClick={() => onSelect(item.id)}
+      onClick={(event) => onSelect(event, item)}
       onContextMenu={(event) => onContextMenu(event, item)}
       className={classNames(
         "flex w-full items-center gap-2 rounded-xl border px-2 py-1 text-left transition",
         isActive
           ? "border-zinc-950 bg-zinc-950 text-white dark:border-white dark:bg-white dark:text-zinc-950"
+          : isSelected
+            ? "border-sky-700 bg-sky-50 text-zinc-950 dark:border-sky-500 dark:bg-sky-950/40 dark:text-zinc-50"
           : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
       )}
       style={{ height: `${itemHeight - 4}px` }}
@@ -193,6 +269,7 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
   expandedPaths,
   folderFiles,
   activeFileId,
+  selectedItemIds,
   onSelect,
   onToggle,
   onSelectFile,
@@ -205,9 +282,10 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
   expandedPaths: Set<string>;
   folderFiles: Map<string, MediaItem[]>;
   activeFileId: string | null;
+  selectedItemIds: Set<string>;
   onSelect: (path: string) => void;
   onToggle: (path: string) => void;
-  onSelectFile: (item: MediaItem) => void;
+  onSelectFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
   onContextMenuFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
 }) {
   const node = nodes.get(nodePath);
@@ -283,12 +361,14 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
             <button
               key={file.id}
               type="button"
-              onClick={() => onSelectFile(file)}
+              onClick={(event) => onSelectFile(event, file)}
               onContextMenu={(event) => onContextMenuFile(event, file)}
               className={classNames(
                 "flex w-full items-center gap-2 rounded-lg px-2 py-0.5 text-left transition",
                 activeFileId === file.id
                   ? "bg-zinc-900/90 text-white dark:bg-zinc-100 dark:text-zinc-950"
+                  : selectedItemIds.has(file.id)
+                    ? "bg-zinc-200 text-zinc-950 dark:bg-zinc-800 dark:text-zinc-50"
                   : "hover:bg-zinc-100 dark:hover:bg-zinc-900",
               )}
               data-tree-key={`file:${file.id}`}
@@ -327,6 +407,7 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
               expandedPaths={expandedPaths}
               folderFiles={folderFiles}
               activeFileId={activeFileId}
+              selectedItemIds={selectedItemIds}
               onSelect={onSelect}
               onToggle={onToggle}
               onSelectFile={onSelectFile}
@@ -372,6 +453,11 @@ function App() {
     y: number;
     itemId: string;
   } | null>(null);
+  const [contextSubmenu, setContextSubmenu] = useState<ContextSubmenu>(null);
+  const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
+  const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
+  const [tasksPanelOpen, setTasksPanelOpen] = useState(true);
   const explorerRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{
     startX: number;
@@ -437,6 +523,11 @@ function App() {
   );
 
   const filesByFolder = useMemo(() => buildFilesByFolder(sortedTreeItems), [sortedTreeItems]);
+  const selectedItems = useMemo(
+    () => items.filter((item) => selectedItemIds.has(item.id)),
+    [items, selectedItemIds],
+  );
+  const selectedItemCount = selectedItems.length;
 
   const active = useMemo(() => findMediaById(items, activeId), [items, activeId]);
   const activeName = active ? active.name + active.ext : "Select a file";
@@ -449,13 +540,13 @@ function App() {
     () => (active ? assetUrl(active.path) : ""),
     [active?.path],
   );
-
   useEffect(() => {
     setRenameValue(active?.name ?? "");
   }, [active?.id, active?.name]);
 
   useEffect(() => {
     setContextMenu(null);
+    setContextSubmenu(null);
   }, [active?.id, deferredQuery, kindFilter, selectedFolderPath, sortKey]);
 
   useEffect(() => {
@@ -471,9 +562,49 @@ function App() {
     setSelectedFolderPath("");
     setExplorerSelection({ type: "folder", path: "" });
     setExpandedFolderPaths(new Set([""]));
+    setSelectedItemIds(new Set());
+    setSelectionAnchorId(null);
   }, [rootPath]);
 
-  async function loadFolder(root: string, preferredPath?: string | null) {
+  const syncBackgroundTaskEffect = useEffectEvent(async (task: BackgroundTask) => {
+    if (task.status === "completed" && rootPath) {
+      await loadFolder(rootPath, null, { preserveSelection: true });
+      return;
+    }
+
+    if (task.status === "failed" && task.error) {
+      setErrorMessage(task.error);
+    }
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void invoke<BackgroundTask[]>("list_background_tasks")
+      .then((tasks) => {
+        if (!cancelled) {
+          setBackgroundTasks(tasks);
+        }
+      })
+      .catch(() => {});
+
+    const unlistenPromise = listen<BackgroundTask>("background-task-updated", (event) => {
+      const task = event.payload;
+      setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
+      void syncBackgroundTaskEffect(task);
+    });
+
+    return () => {
+      cancelled = true;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [syncBackgroundTaskEffect]);
+
+  async function loadFolder(
+    root: string,
+    preferredPath?: string | null,
+    options?: { preserveSelection?: boolean },
+  ) {
     setIsLoading(true);
     setErrorMessage("");
 
@@ -484,17 +615,21 @@ function App() {
       setItems(result.items);
       setRootFolderName(result.rootName);
       setRootPath(result.rootPath);
-      setSelectedFolderPath("");
-      setExplorerSelection({ type: "folder", path: "" });
+      if (!options?.preserveSelection) {
+        setSelectedFolderPath("");
+        setExplorerSelection({ type: "folder", path: "" });
+      }
 
       const preferred = findMediaByPath(result.items, preferredPath ?? null);
       const fallback =
         activeId && !preferredPath ? findMediaById(result.items, activeId) : null;
       setActiveId(preferred?.id ?? fallback?.id ?? result.items[0]?.id ?? null);
+      return result;
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : "Failed to scan the selected folder.",
       );
+      return null;
     } finally {
       setIsLoading(false);
     }
@@ -555,6 +690,174 @@ function App() {
     } finally {
       setIsSaving(false);
     }
+  }
+
+  async function deleteSelectedItems() {
+    if (!rootPath || selectedItems.length === 0) return;
+    const confirmed = window.confirm(`Delete ${selectedItems.length} selected item(s)?`);
+    if (!confirmed) return;
+
+    setIsSaving(true);
+    setErrorMessage("");
+
+    try {
+      for (const item of selectedItems) {
+        await invoke("delete_media_file", {
+          filePath: item.path,
+        });
+      }
+      setSelectedItemIds(new Set());
+      await loadFolder(rootPath);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to delete the selected files.",
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function handleRemoveBackground(item: MediaItem, engineKey: BackgroundEngineKey) {
+    if (!rootPath) return;
+    if (item.kind !== "image") {
+      setErrorMessage("Background removal is only available for images.");
+      setContextMenu(null);
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+
+    try {
+      const task = await invoke<BackgroundTask>("enqueue_remove_image_background", {
+        filePath: item.path,
+        engineKey,
+      });
+      setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to remove the image background.",
+      );
+    }
+  }
+
+  async function handleRemoveBackgroundSelected(engineKey: BackgroundEngineKey) {
+    if (!rootPath || selectedItems.length === 0) return;
+
+    const imageItems = selectedItems.filter((item) => item.kind === "image");
+    if (imageItems.length === 0) {
+      setErrorMessage("Background removal is only available for selected images.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+
+    try {
+      for (const item of imageItems) {
+        const task = await invoke<BackgroundTask>("enqueue_remove_image_background", {
+          filePath: item.path,
+          engineKey,
+        });
+        setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
+      }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to queue selected background removals.",
+      );
+    }
+  }
+
+  async function cancelBackgroundTask(taskId: string) {
+    try {
+      const task = await invoke<BackgroundTask>("cancel_background_task", { taskId });
+      setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to cancel the queued task.",
+      );
+    }
+  }
+
+  async function retryBackgroundTask(task: BackgroundTask) {
+    try {
+      const nextTask = await invoke<BackgroundTask>("enqueue_remove_image_background", {
+        filePath: task.sourcePath,
+        engineKey: task.engineKey,
+      });
+      setBackgroundTasks((prev) => upsertBackgroundTask(prev, nextTask));
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to retry the background task.",
+      );
+    }
+  }
+
+  async function clearFinishedBackgroundTasks() {
+    try {
+      await invoke("clear_finished_background_tasks");
+      const tasks = await invoke<BackgroundTask[]>("list_background_tasks");
+      setBackgroundTasks(tasks);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to clear finished tasks.",
+      );
+    }
+  }
+
+  function selectSingleItem(item: MediaItem) {
+    const parentPath = parentFolderPath(item.relativePath);
+    setSelectedFolderPath(parentPath);
+    setExplorerSelection({
+      type: "file",
+      id: item.id,
+      parentPath,
+    });
+    setActiveId(item.id);
+    setSelectedItemIds(new Set([item.id]));
+    setSelectionAnchorId(item.id);
+  }
+
+  function applyItemSelection(event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) {
+    const parentPath = parentFolderPath(item.relativePath);
+    setSelectedFolderPath(parentPath);
+    setExplorerSelection({
+      type: "file",
+      id: item.id,
+      parentPath,
+    });
+    setActiveId(item.id);
+
+    if (event.shiftKey && selectionAnchorId) {
+      const orderedIds = selectionOrderedItems.map((candidate) => candidate.id);
+      const anchorIndex = orderedIds.indexOf(selectionAnchorId);
+      const currentIndex = orderedIds.indexOf(item.id);
+
+      if (anchorIndex >= 0 && currentIndex >= 0) {
+        const start = Math.min(anchorIndex, currentIndex);
+        const end = Math.max(anchorIndex, currentIndex);
+        setSelectedItemIds(new Set(orderedIds.slice(start, end + 1)));
+        return;
+      }
+    }
+
+    if (event.ctrlKey || event.metaKey) {
+      setSelectedItemIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(item.id)) {
+          next.delete(item.id);
+        } else {
+          next.add(item.id);
+        }
+        return next;
+      });
+      setSelectionAnchorId(item.id);
+      return;
+    }
+
+    selectSingleItem(item);
   }
 
   function selectNext(delta: -1 | 1) {
@@ -631,6 +934,20 @@ function App() {
     return buildVisibleTreeEntries("", folderTree, expandedFolderPaths, filesByFolder);
   }, [expandedFolderPaths, filesByFolder, folderTree, isSearchMode, sortedTreeItems]);
 
+  const selectionOrderedItems = useMemo(() => {
+    if (isSearchMode) {
+      return sortedTreeItems;
+    }
+
+    const visibleFileIds = visibleTreeEntries
+      .filter((entry): entry is Extract<TreeVisibleEntry, { type: "file" }> => entry.type === "file")
+      .map((entry) => entry.id);
+
+    return visibleFileIds
+      .map((id) => items.find((item) => item.id === id) ?? null)
+      .filter((item): item is MediaItem => item !== null);
+  }, [isSearchMode, items, sortedTreeItems, visibleTreeEntries]);
+
   function toggleFolderExpanded(path: string) {
     setExpandedFolderPaths((prev) => {
       const next = new Set(prev);
@@ -682,22 +999,23 @@ function App() {
       parentPath,
     });
     setActiveId(item.id);
+    setSelectedItemIds((prev) => {
+      if (prev.has(item.id)) {
+        return prev;
+      }
+      return new Set([item.id]);
+    });
+    setSelectionAnchorId(item.id);
     setContextMenu({
       x: event.clientX,
       y: event.clientY,
       itemId: item.id,
     });
+    setContextSubmenu(null);
   }
 
-  function handleTreeFileSelect(item: MediaItem) {
-    const parentPath = parentFolderPath(item.relativePath);
-    setSelectedFolderPath(parentPath);
-    setExplorerSelection({
-      type: "file",
-      id: item.id,
-      parentPath,
-    });
-    setActiveId(item.id);
+  function handleTreeFileSelect(event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) {
+    applyItemSelection(event, item);
   }
 
   function moveTreeSelection(delta: -1 | 1) {
@@ -724,7 +1042,7 @@ function App() {
 
     const item = items.find((candidate) => candidate.id === entry.id);
     if (item) {
-      handleTreeFileSelect(item);
+      selectSingleItem(item);
     }
   }
 
@@ -771,7 +1089,7 @@ function App() {
 
       const item = items.find((candidate) => candidate.id === nextEntry.id);
       if (item) {
-        handleTreeFileSelect(item);
+        selectSingleItem(item);
       }
     }
   }
@@ -943,6 +1261,7 @@ function App() {
 
     function closeContextMenu() {
       setContextMenu(null);
+      setContextSubmenu(null);
     }
 
     window.addEventListener("click", closeContextMenu);
@@ -958,10 +1277,22 @@ function App() {
   const contextMenuItem = contextMenu
     ? findMediaById(items, contextMenu.itemId)
     : null;
+  const contextMenuSelectionItems =
+    contextMenuItem && selectedItemIds.has(contextMenuItem.id) && selectedItemCount > 1
+      ? selectedItems
+      : contextMenuItem
+        ? [contextMenuItem]
+        : [];
+  const contextMenuSelectionImages = contextMenuSelectionItems.filter((item) => item.kind === "image");
   const selectedExplorerKey =
     explorerSelection.type === "file"
       ? `file:${explorerSelection.id}`
       : `folder:${explorerSelection.path}`;
+  const runningTaskCount = backgroundTasks.filter((task) => task.status === "running").length;
+  const queuedTaskCount = backgroundTasks.filter((task) => task.status === "queued").length;
+  const finishedTaskCount = backgroundTasks.filter(
+    (task) => task.status === "completed" || task.status === "failed",
+  ).length;
 
   useEffect(() => {
     const container = explorerRef.current;
@@ -1094,8 +1425,9 @@ function App() {
                             explorerSelection.type === "file" &&
                             item.id === explorerSelection.id
                           }
+                          isSelected={selectedItemIds.has(item.id)}
                           itemHeight={LIST_ITEM_HEIGHT}
-                          onSelect={() => handleTreeFileSelect(item)}
+                          onSelect={handleTreeFileSelect}
                           onContextMenu={handleRowContextMenu}
                         />
                       </div>
@@ -1114,6 +1446,7 @@ function App() {
                     activeFileId={
                       explorerSelection.type === "file" ? explorerSelection.id : null
                     }
+                    selectedItemIds={selectedItemIds}
                     onSelect={handleFolderSelect}
                     onToggle={toggleFolderExpanded}
                     onSelectFile={handleTreeFileSelect}
@@ -1217,30 +1550,222 @@ function App() {
         </div>
       ) : null}
 
-      {contextMenu && contextMenuItem ? (
-        <div
-          className="fixed z-40 min-w-40 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
-          style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
-        >
+      {backgroundTasks.length ? (
+        <div className="fixed bottom-4 right-4 z-40 w-[340px] max-w-[calc(100vw-2rem)] rounded-2xl border border-zinc-800 bg-[#121217]/96 p-3 shadow-2xl backdrop-blur">
           <button
             type="button"
-            onClick={() => openRenameForItem(contextMenuItem)}
-            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+            onClick={() => setTasksPanelOpen((value) => !value)}
+            className="flex w-full items-center justify-between gap-3 text-left"
           >
-            Rename
+            <div>
+              <div className="text-[11px] font-semibold">Background Tasks</div>
+              <div className="mt-0.5 text-[10px] text-zinc-400">
+                {runningTaskCount ? `${runningTaskCount} running` : "No active run"}
+                {queuedTaskCount ? ` / ${queuedTaskCount} queued` : ""}
+                {finishedTaskCount ? ` / ${finishedTaskCount} finished` : ""}
+                {" / 1 at a time"}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {finishedTaskCount ? (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void clearFinishedBackgroundTasks();
+                  }}
+                  className="rounded-full border border-zinc-700 bg-zinc-950 px-2 py-1 text-[9px] text-zinc-300 hover:bg-zinc-900"
+                >
+                  Clear Done
+                </button>
+              ) : null}
+              <div className="rounded-full border border-zinc-700 bg-zinc-950 px-2 py-1 text-[9px] uppercase tracking-[0.16em] text-zinc-300">
+                Queue
+              </div>
+              <div className="rounded-full border border-zinc-700 bg-zinc-950 px-2 py-1 text-[9px] text-zinc-300">
+                {tasksPanelOpen ? "Hide" : "Show"}
+              </div>
+            </div>
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setContextMenu(null);
-              setActiveId(contextMenuItem.id);
-              void deleteItem(contextMenuItem);
-            }}
-            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] text-red-300 hover:bg-red-950/50"
-          >
-            Delete
-          </button>
+
+          {tasksPanelOpen ? (
+          <div className="mt-3 max-h-[240px] space-y-2 overflow-auto pr-1">
+            {backgroundTasks.map((task) => (
+              <div
+                key={task.id}
+                className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-2.5"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="truncate text-[11px] font-medium text-zinc-100">
+                      {task.fileName}
+                    </div>
+                    <div className="mt-0.5 truncate text-[10px] text-zinc-500">
+                      {task.engineLabel} / {task.message}
+                    </div>
+                  </div>
+                  <div
+                    className={classNames(
+                      "shrink-0 rounded-full px-2 py-0.5 text-[9px] font-semibold",
+                      task.status === "completed"
+                        ? "bg-emerald-950 text-emerald-200"
+                        : task.status === "failed"
+                          ? "bg-red-950 text-red-200"
+                          : task.status === "running"
+                            ? "bg-sky-950 text-sky-200"
+                            : "bg-zinc-800 text-zinc-300",
+                    )}
+                  >
+                    {backgroundTaskLabel(task.status)}
+                  </div>
+                </div>
+
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
+                  {task.status === "running" ? (
+                    <div className="relative h-full w-full overflow-hidden rounded-full bg-sky-950">
+                      <div className="absolute inset-y-0 left-0 w-1/3 animate-pulse rounded-full bg-sky-400" />
+                    </div>
+                  ) : (
+                    <div
+                      className={classNames(
+                        "h-full rounded-full transition-all duration-300",
+                        task.status === "completed"
+                          ? "bg-emerald-400"
+                          : task.status === "failed"
+                            ? "bg-red-400"
+                            : "bg-zinc-500",
+                      )}
+                      style={{ width: `${Math.max(task.progress, task.status === "queued" ? 6 : 0)}%` }}
+                    />
+                  )}
+                </div>
+
+                <div className="mt-2 flex items-center justify-between gap-3 text-[10px] text-zinc-500">
+                  <div>{backgroundTaskProgressLabel(task)}</div>
+                  <div className="truncate">
+                    {task.status === "queued" ? "Reserved in queue" : task.outputPath}
+                  </div>
+                </div>
+
+                <div className="mt-2 flex items-center justify-end gap-2">
+                  {task.status === "queued" ? (
+                    <button
+                      type="button"
+                      onClick={() => void cancelBackgroundTask(task.id)}
+                      className="rounded-md border border-amber-900/70 px-2 py-1 text-[10px] text-amber-200 hover:bg-amber-950/40"
+                    >
+                      Cancel
+                    </button>
+                  ) : null}
+                  {task.status === "failed" ? (
+                    <button
+                      type="button"
+                      onClick={() => void retryBackgroundTask(task)}
+                      className="rounded-md border border-zinc-700 px-2 py-1 text-[10px] text-zinc-200 hover:bg-zinc-900"
+                    >
+                      Retry
+                    </button>
+                  ) : null}
+                </div>
+
+                {task.warning ? (
+                  <div className="mt-2 rounded-lg border border-amber-900/80 bg-amber-950/40 px-2 py-1.5 text-[10px] text-amber-200">
+                    {task.warning}
+                  </div>
+                ) : null}
+
+                {task.error ? (
+                  <div className="mt-2 rounded-lg border border-red-950/80 bg-red-950/40 px-2 py-1.5 text-[10px] text-red-200">
+                    {task.error}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+          ) : null}
         </div>
+      ) : null}
+
+      {contextMenu && contextMenuItem ? (
+        <>
+          <div
+            className="fixed z-40 min-w-44 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
+            style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+          >
+            {contextMenuItem.kind === "image" ? (
+              <button
+                type="button"
+                onMouseEnter={() => setContextSubmenu("background-remove")}
+                onClick={() =>
+                  setContextSubmenu((prev) =>
+                    prev === "background-remove" ? null : "background-remove",
+                  )
+                }
+                className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                <span>
+                  {contextMenuSelectionItems.length > 1
+                    ? `Remove Background for Selected (${contextMenuSelectionImages.length})`
+                    : "Remove Background"}
+                </span>
+                <span className="text-zinc-500">&gt;</span>
+              </button>
+            ) : null}
+            {contextMenuSelectionItems.length === 1 ? (
+              <button
+                type="button"
+                onClick={() => openRenameForItem(contextMenuItem)}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                Rename
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                setContextSubmenu(null);
+                setContextMenu(null);
+                if (contextMenuSelectionItems.length > 1) {
+                  void deleteSelectedItems();
+                  return;
+                }
+                setActiveId(contextMenuItem.id);
+                void deleteItem(contextMenuItem);
+              }}
+              className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] text-red-300 hover:bg-red-950/50"
+            >
+              {contextMenuSelectionItems.length > 1
+                ? `Delete Selected (${contextMenuSelectionItems.length})`
+                : "Delete"}
+            </button>
+          </div>
+
+          {contextMenuItem.kind === "image" && contextSubmenu === "background-remove" ? (
+            <div
+              className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
+              style={{ left: `${contextMenu.x + 182}px`, top: `${contextMenu.y}px` }}
+            >
+              <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+                Choose Engine
+              </div>
+              {BACKGROUND_ENGINES.map((engine) => (
+                <button
+                  key={engine.key}
+                  type="button"
+                  onClick={() =>
+                    contextMenuSelectionItems.length > 1
+                      ? void handleRemoveBackgroundSelected(engine.key)
+                      : void handleRemoveBackground(contextMenuItem, engine.key)
+                  }
+                  disabled={contextMenuSelectionImages.length === 0}
+                  className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                >
+                  {engine.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </>
       ) : null}
 
       {renameOpen && active ? (
@@ -1448,3 +1973,4 @@ function App() {
 }
 
 export default App;
+
