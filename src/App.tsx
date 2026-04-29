@@ -2,7 +2,9 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   memo,
+  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  type SyntheticEvent,
   type WheelEvent as ReactWheelEvent,
   useDeferredValue,
   useEffect,
@@ -102,6 +104,42 @@ function clampMenuPosition(x: number, y: number, width: number, height: number) 
   };
 }
 
+function resolveVideoVrLayout(
+  setting: VideoVrLayoutSetting,
+  dimensions: { width: number; height: number } | null,
+): VideoVrLayout {
+  if (setting !== "auto") {
+    return setting;
+  }
+
+  if (dimensions && dimensions.height > dimensions.width) {
+    return "ou";
+  }
+
+  return "sbs";
+}
+
+function videoVrTransformStyle(
+  enabled: boolean,
+  layout: VideoVrLayout,
+): CSSProperties | undefined {
+  if (!enabled) {
+    return undefined;
+  }
+
+  if (layout === "ou") {
+    return {
+      transform: "scaleY(2)",
+      transformOrigin: "center top",
+    };
+  }
+
+  return {
+    transform: "scaleX(2)",
+    transformOrigin: "left center",
+  };
+}
+
 function upsertBackgroundTask(tasks: BackgroundTask[], task: BackgroundTask) {
   const existingIndex = tasks.findIndex((candidate) => candidate.id === task.id);
   if (existingIndex < 0) {
@@ -151,6 +189,8 @@ type FrameExtractPresetKey =
   | "fps_60";
 type AnimationExportFormat = "gif" | "webp";
 type ContextSubmenu = "background-remove" | "extract-frames" | null;
+type VideoVrLayout = "sbs" | "ou";
+type VideoVrLayoutSetting = "auto" | VideoVrLayout;
 type ContextMenuState =
   | { x: number; y: number; target: "item"; itemId: string }
   | { x: number; y: number; target: "folder"; folderPath: string };
@@ -470,6 +510,13 @@ function App() {
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [videoMuted, setVideoMuted] = useState(true);
+  const [videoVrEnabled, setVideoVrEnabled] = useState(false);
+  const [videoVrLayoutSetting, setVideoVrLayoutSetting] =
+    useState<VideoVrLayoutSetting>("auto");
+  const [activeVideoDimensions, setActiveVideoDimensions] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const [items, setItems] = useState<MediaItem[]>([]);
   const [rootFolderName, setRootFolderName] = useState("");
   const [rootPath, setRootPath] = useState("");
@@ -588,6 +635,10 @@ function App() {
   const selectedItemCount = selectedItems.length;
 
   const active = useMemo(() => findMediaById(items, activeId), [items, activeId]);
+  const resolvedVideoVrLayout = useMemo(
+    () => resolveVideoVrLayout(videoVrLayoutSetting, activeVideoDimensions),
+    [activeVideoDimensions, videoVrLayoutSetting],
+  );
   const activeName = active ? active.name + active.ext : "Select a file";
   const activeLocation = active
     ? active.relativePath
@@ -623,6 +674,12 @@ function App() {
     setSelectedItemIds(new Set());
     setSelectionAnchorId(null);
   }, [rootPath]);
+
+  useEffect(() => {
+    setVideoVrEnabled(false);
+    setVideoVrLayoutSetting("auto");
+    setActiveVideoDimensions(null);
+  }, [active?.id, active?.kind]);
 
   const syncBackgroundTaskEffect = useEffectEvent(async (task: BackgroundTask) => {
     if (task.status === "completed" && rootPath && task.kind !== "extractFrames") {
@@ -1404,6 +1461,44 @@ function App() {
     handleFolderSelect(parentFolderPath(selectedFolderEntry.path));
   }
 
+  function handleVideoMetadata(event: SyntheticEvent<HTMLVideoElement>) {
+    const { videoWidth, videoHeight } = event.currentTarget;
+    if (!videoWidth || !videoHeight) return;
+
+    setActiveVideoDimensions((prev) => {
+      if (prev?.width === videoWidth && prev.height === videoHeight) {
+        return prev;
+      }
+
+      return { width: videoWidth, height: videoHeight };
+    });
+  }
+
+  function cycleVideoVrLayout() {
+    setVideoVrLayoutSetting((prev) => {
+      if (prev === "auto") return "sbs";
+      if (prev === "sbs") return "ou";
+      return "auto";
+    });
+  }
+
+  function renderVideoPreview(extraClassName?: string) {
+    return (
+      <div className="h-full w-full overflow-hidden bg-black">
+        <video
+          src={previewSourceUrl}
+          className={classNames("h-full w-full object-contain", extraClassName)}
+          controls
+          autoPlay
+          muted={videoMuted}
+          preload="metadata"
+          onLoadedMetadata={handleVideoMetadata}
+          style={videoVrTransformStyle(videoVrEnabled, resolvedVideoVrLayout)}
+        />
+      </div>
+    );
+  }
+
   const previewContent = active ? (
     active.kind === "image" ? (
       <img
@@ -1412,14 +1507,7 @@ function App() {
         className="max-h-full max-w-full object-contain"
       />
     ) : (
-      <video
-        src={previewSourceUrl}
-        className="h-full w-full object-contain"
-        controls
-        autoPlay
-        muted={videoMuted}
-        preload="metadata"
-      />
+      renderVideoPreview()
     )
   ) : (
     <div className="text-center text-zinc-400">
@@ -1890,6 +1978,29 @@ function App() {
                   <div className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] dark:border-zinc-800 dark:bg-zinc-950">
                     {active.kind === "video" ? "Video" : "Image"}
                   </div>
+                  {active.kind === "video" ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setVideoVrEnabled((value) => !value)}
+                        className={classNames(
+                          "rounded-full border px-2.5 py-1 text-[10px]",
+                          videoVrEnabled
+                            ? "border-sky-700 bg-sky-950/70 text-sky-100"
+                            : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
+                        )}
+                      >
+                        VR {videoVrEnabled ? "On" : "Off"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={cycleVideoVrLayout}
+                        className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
+                      >
+                        Mode {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
+                      </button>
+                    </>
+                  ) : null}
                   <button
                     type="button"
                     onClick={() => setInfoOpen(true)}
@@ -2542,13 +2653,34 @@ function App() {
                   </>
                 ) : null}
                 {active.kind === "video" ? (
-                  <button
-                    className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
-                    type="button"
-                    onClick={() => setVideoMuted((value) => !value)}
-                  >
-                    Audio {videoMuted ? "Off" : "On"}
-                  </button>
+                  <>
+                    <button
+                      className={classNames(
+                        "rounded-md border px-3 py-1.5 text-xs",
+                        videoVrEnabled
+                          ? "border-sky-700 bg-sky-950/70 text-sky-100 hover:bg-sky-900/70"
+                          : "border-zinc-700 bg-zinc-900 hover:bg-zinc-800",
+                      )}
+                      type="button"
+                      onClick={() => setVideoVrEnabled((value) => !value)}
+                    >
+                      VR {videoVrEnabled ? "On" : "Off"}
+                    </button>
+                    <button
+                      className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
+                      type="button"
+                      onClick={cycleVideoVrLayout}
+                    >
+                      Mode {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
+                    </button>
+                    <button
+                      className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
+                      type="button"
+                      onClick={() => setVideoMuted((value) => !value)}
+                    >
+                      Audio {videoMuted ? "Off" : "On"}
+                    </button>
+                  </>
                 ) : null}
                 <button
                   className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
@@ -2582,7 +2714,7 @@ function App() {
                       }}
                     />
                   ) : (
-                    previewContent
+                    renderVideoPreview("bg-black")
                   )}
                 </div>
                 <button
