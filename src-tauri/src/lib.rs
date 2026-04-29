@@ -45,6 +45,8 @@ struct BackgroundTask {
     kind: String,
     engine_key: String,
     engine_label: String,
+    extract_eye_mode: Option<String>,
+    extract_layout: Option<String>,
     source_path: String,
     output_path: String,
     file_name: String,
@@ -532,6 +534,8 @@ fn enqueue_background_task(
             kind: "removeBackground".to_string(),
             engine_key,
             engine_label,
+            extract_eye_mode: None,
+            extract_layout: None,
             source_path: source.to_string_lossy().to_string(),
             output_path: output_path.to_string_lossy().to_string(),
             file_name,
@@ -673,12 +677,43 @@ fn frame_extraction_filter(preset_key: &str, duration_seconds: f64) -> Result<St
     Ok(filter)
 }
 
-fn perform_frame_extraction(source_path: &str, output_dir: &str, preset_key: &str) -> Result<(), String> {
+fn frame_extraction_crop_filter(
+    eye_mode: &str,
+    layout: &str,
+) -> Result<Option<String>, String> {
+    match eye_mode {
+        "standard" => Ok(None),
+        "left" => match layout {
+            "sbs" => Ok(Some("crop=iw/2:ih:0:0".to_string())),
+            "ou" => Ok(Some("crop=iw:ih/2:0:0".to_string())),
+            _ => Err("Unknown VR layout.".to_string()),
+        },
+        "right" => match layout {
+            "sbs" => Ok(Some("crop=iw/2:ih:iw/2:0".to_string())),
+            "ou" => Ok(Some("crop=iw:ih/2:0:ih/2".to_string())),
+            _ => Err("Unknown VR layout.".to_string()),
+        },
+        _ => Err("Unknown eye mode.".to_string()),
+    }
+}
+
+fn perform_frame_extraction(
+    source_path: &str,
+    output_dir: &str,
+    preset_key: &str,
+    eye_mode: &str,
+    layout: &str,
+) -> Result<(), String> {
     let source = PathBuf::from(source_path);
     let output = PathBuf::from(output_dir);
     let ffmpeg = detect_ffmpeg_binary("ffmpeg")?;
     let duration_seconds = video_duration_seconds(&source)?;
     let fps_filter = frame_extraction_filter(preset_key, duration_seconds)?;
+    let crop_filter = frame_extraction_crop_filter(eye_mode, layout)?;
+    let video_filter = match crop_filter {
+        Some(crop) => format!("{crop},{fps_filter}"),
+        None => fps_filter,
+    };
 
     fs::create_dir_all(&output).map_err(|error| error.to_string())?;
     let stem = source
@@ -694,7 +729,7 @@ fn perform_frame_extraction(source_path: &str, output_dir: &str, preset_key: &st
         "-i".to_string(),
         source.to_string_lossy().to_string(),
         "-vf".to_string(),
-        fps_filter,
+        video_filter,
         "-vsync".to_string(),
         "vfr".to_string(),
         "-q:v".to_string(),
@@ -848,9 +883,23 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
             let source_path = task.source_path.clone();
             let output_path = task.output_path.clone();
             let engine_key = task.engine_key.clone();
+            let extract_eye_mode = task
+                .extract_eye_mode
+                .clone()
+                .unwrap_or_else(|| "standard".to_string());
+            let extract_layout = task
+                .extract_layout
+                .clone()
+                .unwrap_or_else(|| "sbs".to_string());
             let task_kind = task.kind.clone();
             let result = tauri::async_runtime::spawn_blocking(move || match task_kind.as_str() {
-                "extractFrames" => perform_frame_extraction(&source_path, &output_path, &engine_key),
+                "extractFrames" => perform_frame_extraction(
+                    &source_path,
+                    &output_path,
+                    &engine_key,
+                    &extract_eye_mode,
+                    &extract_layout,
+                ),
                 _ => perform_background_removal_with_engine(&source_path, &output_path, &engine_key),
             })
             .await
@@ -1081,6 +1130,8 @@ fn enqueue_extract_video_frames(
     state: State<'_, BackgroundRemovalState>,
     file_path: String,
     preset_key: String,
+    eye_mode: Option<String>,
+    layout: Option<String>,
 ) -> Result<BackgroundTask, String> {
     let source = PathBuf::from(&file_path);
     if !source.exists() {
@@ -1103,6 +1154,14 @@ fn enqueue_extract_video_frames(
     detect_ffmpeg_binary("ffprobe")?;
 
     let output_dir = extract_frames_output_dir(&source)?;
+    let extract_eye_mode = eye_mode.unwrap_or_else(|| "standard".to_string());
+    if !matches!(extract_eye_mode.as_str(), "standard" | "left" | "right") {
+        return Err("Unknown eye mode.".to_string());
+    }
+    let extract_layout = layout.unwrap_or_else(|| "sbs".to_string());
+    if !matches!(extract_layout.as_str(), "sbs" | "ou") {
+        return Err("Unknown VR layout.".to_string());
+    }
     let preset_label = match preset_key.as_str() {
         "summary_12" => "Summary 12 Frames",
         "summary_24" => "Summary 24 Frames",
@@ -1132,6 +1191,8 @@ fn enqueue_extract_video_frames(
             kind: "extractFrames".to_string(),
             engine_key: preset_key,
             engine_label: preset_label,
+            extract_eye_mode: Some(extract_eye_mode),
+            extract_layout: Some(extract_layout),
             source_path: source.to_string_lossy().to_string(),
             output_path: output_dir.to_string_lossy().to_string(),
             file_name,

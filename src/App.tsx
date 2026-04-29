@@ -39,6 +39,8 @@ type BackgroundTask = {
   kind: string;
   engineKey: string;
   engineLabel: string;
+  extractEyeMode?: VideoEyeMode | null;
+  extractLayout?: VideoVrLayout | null;
   sourcePath: string;
   outputPath: string;
   fileName: string;
@@ -1023,6 +1025,8 @@ function App() {
       const task = await invoke<BackgroundTask>("enqueue_extract_video_frames", {
         filePath: item.path,
         presetKey,
+        eyeMode: videoEyeMode,
+        layout: currentExtractLayout(),
       });
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
     } catch (error) {
@@ -1048,6 +1052,8 @@ function App() {
         const task = await invoke<BackgroundTask>("enqueue_extract_video_frames", {
           filePath: item.path,
           presetKey,
+          eyeMode: videoEyeMode,
+          layout: currentExtractLayout(),
         });
         setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
       }
@@ -1076,6 +1082,8 @@ function App() {
           ? await invoke<BackgroundTask>("enqueue_extract_video_frames", {
               filePath: task.sourcePath,
               presetKey: task.engineKey,
+              eyeMode: task.extractEyeMode ?? "standard",
+              layout: task.extractLayout ?? "sbs",
             })
           : await invoke<BackgroundTask>("enqueue_remove_image_background", {
               filePath: task.sourcePath,
@@ -1512,6 +1520,10 @@ function App() {
         />
       </div>
     );
+  }
+
+  function currentExtractLayout(): VideoVrLayout {
+    return resolvedVideoVrLayout;
   }
 
   const previewContent = active ? (
