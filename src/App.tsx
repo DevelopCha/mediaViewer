@@ -625,7 +625,7 @@ function App() {
   }, [rootPath]);
 
   const syncBackgroundTaskEffect = useEffectEvent(async (task: BackgroundTask) => {
-    if (task.status === "completed" && rootPath) {
+    if (task.status === "completed" && rootPath && task.kind !== "extractFrames") {
       await loadFolder(rootPath, null, { preserveSelection: true });
       return;
     }

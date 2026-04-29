@@ -208,6 +208,24 @@ fn run_command(program: &str, args: &[String], working_dir: &Path) -> Result<(),
     Err(details)
 }
 
+fn run_command_without_capture(
+    program: &str,
+    args: &[String],
+    working_dir: &Path,
+) -> Result<(), String> {
+    let status = silent_command(program)
+        .args(args)
+        .current_dir(working_dir)
+        .status()
+        .map_err(|error| error.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Command failed with status {status}."))
+    }
+}
+
 fn ensure_rembg_python() -> Result<PathBuf, String> {
     let venv_python = rembg_python_path();
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -684,7 +702,7 @@ fn perform_frame_extraction(source_path: &str, output_dir: &str, preset_key: &st
         output_pattern.to_string_lossy().to_string(),
     ];
 
-    run_command(&ffmpeg, &args, &output)
+    run_command_without_capture(&ffmpeg, &args, &output)
         .map_err(|error| format!("Frame extraction failed. {error}"))
 }
 
