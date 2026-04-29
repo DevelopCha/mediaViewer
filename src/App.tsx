@@ -57,6 +57,9 @@ const LIST_ITEM_HEIGHT = 62;
 const DEFAULT_FOLDER_WIDTH = 276;
 const MIN_FOLDER_WIDTH = 220;
 const MAX_FOLDER_WIDTH = 460;
+const CONTEXT_MENU_WIDTH = 176;
+const CONTEXT_SUBMENU_WIDTH = 224;
+const MENU_VIEWPORT_MARGIN = 12;
 
 function formatBytes(bytes: number) {
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -83,6 +86,20 @@ function assetUrl(path: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function clampMenuPosition(x: number, y: number, width: number, height: number) {
+  if (typeof window === "undefined") {
+    return { x, y };
+  }
+
+  const maxX = Math.max(MENU_VIEWPORT_MARGIN, window.innerWidth - width - MENU_VIEWPORT_MARGIN);
+  const maxY = Math.max(MENU_VIEWPORT_MARGIN, window.innerHeight - height - MENU_VIEWPORT_MARGIN);
+
+  return {
+    x: clamp(x, MENU_VIEWPORT_MARGIN, maxX),
+    y: clamp(y, MENU_VIEWPORT_MARGIN, maxY),
+  };
 }
 
 function upsertBackgroundTask(tasks: BackgroundTask[], task: BackgroundTask) {
@@ -516,14 +533,19 @@ function App() {
   function handleFolderSelect(path: string) {
     setSelectedFolderPath(path);
     setExplorerSelection({ type: "folder", path });
+    const folderItems = treeSourceItems.filter((item) =>
+      path ? item.relativePath.startsWith(`${path}/`) : true,
+    );
+    setSelectedItemIds(new Set(folderItems.map((item) => item.id)));
+    setSelectionAnchorId(folderItems[0]?.id ?? null);
     const node = folderTree.get(path);
     if (!node?.coverPath) {
-      setActiveId(null);
+      setActiveId(folderItems[0]?.id ?? null);
       return;
     }
 
     const coverItem = findMediaByPath(items, node.coverPath);
-    setActiveId(coverItem?.id ?? null);
+    setActiveId(coverItem?.id ?? folderItems[0]?.id ?? null);
   }
 
   const filtered = useMemo(
@@ -1514,6 +1536,29 @@ function App() {
         : [];
   const contextMenuSelectionImages = contextMenuSelectionItems.filter((item) => item.kind === "image");
   const contextMenuSelectionVideos = contextMenuSelectionItems.filter((item) => item.kind === "video");
+  const contextMenuEntryCount =
+    (contextMenuItem?.kind === "image" ? 1 : 0) +
+    (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
+    (contextMenuItem?.kind === "video" ? 1 : 0) +
+    (contextMenuSelectionItems.length === 1 ? 1 : 0) +
+    1;
+  const contextMenuPosition = contextMenu
+    ? clampMenuPosition(contextMenu.x, contextMenu.y, CONTEXT_MENU_WIDTH, 16 + contextMenuEntryCount * 38)
+    : null;
+  const contextSubmenuX =
+    contextMenuPosition && typeof window !== "undefined"
+      ? contextMenuPosition.x + CONTEXT_MENU_WIDTH + MENU_VIEWPORT_MARGIN + CONTEXT_SUBMENU_WIDTH <= window.innerWidth
+        ? contextMenuPosition.x + CONTEXT_MENU_WIDTH + 6
+        : contextMenuPosition.x - CONTEXT_SUBMENU_WIDTH - 6
+      : 0;
+  const backgroundSubmenuPosition =
+    contextMenuPosition && contextMenuItem?.kind === "image"
+      ? clampMenuPosition(contextSubmenuX, contextMenuPosition.y, CONTEXT_SUBMENU_WIDTH, 16 + BACKGROUND_ENGINES.length * 38)
+      : null;
+  const extractSubmenuPosition =
+    contextMenuPosition && contextMenuItem?.kind === "video"
+      ? clampMenuPosition(contextSubmenuX, contextMenuPosition.y + 34, CONTEXT_SUBMENU_WIDTH, 16 + FRAME_EXTRACT_PRESETS.length * 38)
+      : null;
   const selectedExplorerKey =
     explorerSelection.type === "file"
       ? `file:${explorerSelection.id}`
@@ -1920,7 +1965,7 @@ function App() {
         <>
           <div
             className="fixed z-40 min-w-44 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
-            style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+            style={{ left: `${contextMenuPosition?.x ?? 0}px`, top: `${contextMenuPosition?.y ?? 0}px` }}
           >
             {contextMenuItem.kind === "image" ? (
               <button
@@ -2001,7 +2046,10 @@ function App() {
           {contextMenuItem.kind === "image" && contextSubmenu === "background-remove" ? (
             <div
               className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
-              style={{ left: `${contextMenu.x + 182}px`, top: `${contextMenu.y}px` }}
+              style={{
+                left: `${backgroundSubmenuPosition?.x ?? 0}px`,
+                top: `${backgroundSubmenuPosition?.y ?? 0}px`,
+              }}
             >
               <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
                 Choose Engine
@@ -2026,7 +2074,10 @@ function App() {
           {contextMenuItem.kind === "video" && contextSubmenu === "extract-frames" ? (
             <div
               className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
-              style={{ left: `${contextMenu.x + 182}px`, top: `${contextMenu.y + 34}px` }}
+              style={{
+                left: `${extractSubmenuPosition?.x ?? 0}px`,
+                top: `${extractSubmenuPosition?.y ?? 0}px`,
+              }}
             >
               <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
                 Choose Extract Mode
