@@ -151,6 +151,9 @@ type FrameExtractPresetKey =
   | "fps_60";
 type AnimationExportFormat = "gif" | "webp";
 type ContextSubmenu = "background-remove" | "extract-frames" | null;
+type ContextMenuState =
+  | { x: number; y: number; target: "item"; itemId: string }
+  | { x: number; y: number; target: "folder"; folderPath: string };
 
 const BACKGROUND_ENGINES: Array<{
   key: BackgroundEngineKey;
@@ -311,6 +314,7 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
   onSelect,
   onToggle,
   onSelectFile,
+  onContextMenuFolder,
   onContextMenuFile,
 }: {
   nodePath: string;
@@ -324,6 +328,7 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
   onSelect: (path: string) => void;
   onToggle: (path: string) => void;
   onSelectFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
+  onContextMenuFolder: (event: ReactMouseEvent<HTMLButtonElement>, path: string) => void;
   onContextMenuFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
 }) {
   const node = nodes.get(nodePath);
@@ -350,6 +355,7 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
         <button
           type="button"
           onClick={() => onSelect(node.path)}
+          onContextMenu={(event) => onContextMenuFolder(event, node.path)}
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           <div className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md bg-zinc-200 text-[8px] font-semibold text-zinc-500 dark:bg-zinc-800 dark:text-zinc-300">
@@ -449,6 +455,7 @@ const FolderTreeBranch = memo(function FolderTreeBranch({
               onSelect={onSelect}
               onToggle={onToggle}
               onSelectFile={onSelectFile}
+              onContextMenuFolder={onContextMenuFolder}
               onContextMenuFile={onContextMenuFile}
             />
           ))}
@@ -486,11 +493,7 @@ function App() {
   const [imageZoom, setImageZoom] = useState(1);
   const [imageOffset, setImageOffset] = useState({ x: 0, y: 0 });
   const [isDraggingImage, setIsDraggingImage] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{
-    x: number;
-    y: number;
-    itemId: string;
-  } | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [contextSubmenu, setContextSubmenu] = useState<ContextSubmenu>(null);
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
   const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
@@ -769,6 +772,113 @@ function App() {
       );
     } finally {
       setIsSaving(false);
+    }
+  }
+
+  function relativeFolderPathFromAbsolute(path: string) {
+    if (!rootPath) return "";
+    const normalizedRoot = rootPath.split("\\").join("/");
+    const normalizedPath = path.split("\\").join("/");
+    if (normalizedPath === normalizedRoot) {
+      return "";
+    }
+    return normalizedPath.startsWith(`${normalizedRoot}/`)
+      ? normalizedPath.slice(normalizedRoot.length + 1)
+      : "";
+  }
+
+  async function duplicateItem(item: MediaItem) {
+    if (!rootPath) return;
+    setErrorMessage("");
+    setContextMenu(null);
+
+    try {
+      const duplicatedPath = await invoke<string>("duplicate_media_file", {
+        filePath: item.path,
+      });
+      await loadFolder(rootPath, duplicatedPath);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to duplicate the selected file.",
+      );
+    }
+  }
+
+  async function createFolderAt(relativeFolderPath: string) {
+    if (!rootPath) return;
+    setErrorMessage("");
+    setContextMenu(null);
+
+    try {
+      const createdFolderPath = await invoke<string>("create_media_folder", {
+        rootPath,
+        relativeFolderPath,
+      });
+      const result = await loadFolder(rootPath, null, { preserveSelection: true });
+      const nextFolderPath = relativeFolderPathFromAbsolute(createdFolderPath);
+      setSelectedFolderPath(nextFolderPath);
+      setExplorerSelection({ type: "folder", path: nextFolderPath });
+      const folderItems =
+        result?.items.filter((item) =>
+          nextFolderPath ? item.relativePath.startsWith(`${nextFolderPath}/`) : true,
+        ) ?? [];
+      setSelectedItemIds(new Set(folderItems.map((item) => item.id)));
+      setSelectionAnchorId(folderItems[0]?.id ?? null);
+      setActiveId(folderItems[0]?.id ?? null);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to create a new folder.",
+      );
+    }
+  }
+
+  async function duplicateFolderAt(relativeFolderPath: string) {
+    if (!rootPath || !relativeFolderPath) return;
+    setErrorMessage("");
+    setContextMenu(null);
+
+    try {
+      const duplicatedFolderPath = await invoke<string>("duplicate_media_folder", {
+        rootPath,
+        relativeFolderPath,
+      });
+      const result = await loadFolder(rootPath, null, { preserveSelection: true });
+      const nextFolderPath = relativeFolderPathFromAbsolute(duplicatedFolderPath);
+      setSelectedFolderPath(nextFolderPath);
+      setExplorerSelection({ type: "folder", path: nextFolderPath });
+      const folderItems =
+        result?.items.filter((item) =>
+          nextFolderPath ? item.relativePath.startsWith(`${nextFolderPath}/`) : true,
+        ) ?? [];
+      setSelectedItemIds(new Set(folderItems.map((item) => item.id)));
+      setSelectionAnchorId(folderItems[0]?.id ?? null);
+      setActiveId(folderItems[0]?.id ?? null);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to duplicate the selected folder.",
+      );
+    }
+  }
+
+  async function deleteFolderAt(relativeFolderPath: string) {
+    if (!rootPath || !relativeFolderPath) return;
+    const folderLabel = relativeFolderPath.split("/").pop() || relativeFolderPath;
+    const confirmed = window.confirm(`Delete folder "${folderLabel}" and everything inside it?`);
+    if (!confirmed) return;
+
+    setErrorMessage("");
+    setContextMenu(null);
+
+    try {
+      await invoke("delete_media_folder", {
+        rootPath,
+        relativeFolderPath,
+      });
+      await loadFolder(rootPath);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to delete the selected folder.",
+      );
     }
   }
 
@@ -1129,7 +1239,20 @@ function App() {
     setContextMenu({
       x: event.clientX,
       y: event.clientY,
+      target: "item",
       itemId: item.id,
+    });
+    setContextSubmenu(null);
+  }
+
+  function handleFolderContextMenu(event: ReactMouseEvent<HTMLButtonElement>, path: string) {
+    event.preventDefault();
+    handleFolderSelect(path);
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      target: "folder",
+      folderPath: path,
     });
     setContextSubmenu(null);
   }
@@ -1525,9 +1648,9 @@ function App() {
     };
   }, [contextMenu]);
 
-  const contextMenuItem = contextMenu
-    ? findMediaById(items, contextMenu.itemId)
-    : null;
+  const contextMenuItem =
+    contextMenu?.target === "item" ? findMediaById(items, contextMenu.itemId) : null;
+  const contextMenuFolderPath = contextMenu?.target === "folder" ? contextMenu.folderPath : null;
   const contextMenuSelectionItems =
     contextMenuItem && selectedItemIds.has(contextMenuItem.id) && selectedItemCount > 1
       ? selectedItems
@@ -1536,12 +1659,13 @@ function App() {
         : [];
   const contextMenuSelectionImages = contextMenuSelectionItems.filter((item) => item.kind === "image");
   const contextMenuSelectionVideos = contextMenuSelectionItems.filter((item) => item.kind === "video");
-  const contextMenuEntryCount =
-    (contextMenuItem?.kind === "image" ? 1 : 0) +
-    (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
-    (contextMenuItem?.kind === "video" ? 1 : 0) +
-    (contextMenuSelectionItems.length === 1 ? 1 : 0) +
-    1;
+  const contextMenuEntryCount = contextMenuFolderPath !== null
+    ? 1 + (contextMenuFolderPath ? 2 : 0)
+    : (contextMenuItem?.kind === "image" ? 1 : 0) +
+      (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
+      (contextMenuItem?.kind === "video" ? 1 : 0) +
+      (contextMenuSelectionItems.length === 1 ? 2 : 0) +
+      1;
   const contextMenuPosition = contextMenu
     ? clampMenuPosition(contextMenu.x, contextMenu.y, CONTEXT_MENU_WIDTH, 16 + contextMenuEntryCount * 38)
     : null;
@@ -1725,6 +1849,7 @@ function App() {
                     onSelect={handleFolderSelect}
                     onToggle={toggleFolderExpanded}
                     onSelectFile={handleTreeFileSelect}
+                    onContextMenuFolder={handleFolderContextMenu}
                     onContextMenuFile={handleRowContextMenu}
                   />
                 )}
@@ -1961,13 +2086,42 @@ function App() {
         </div>
       ) : null}
 
-      {contextMenu && contextMenuItem ? (
+      {contextMenu && (contextMenuItem || contextMenuFolderPath !== null) ? (
         <>
           <div
             className="fixed z-40 min-w-44 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
             style={{ left: `${contextMenuPosition?.x ?? 0}px`, top: `${contextMenuPosition?.y ?? 0}px` }}
           >
-            {contextMenuItem.kind === "image" ? (
+            {contextMenuFolderPath !== null ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void createFolderAt(contextMenuFolderPath)}
+                  className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                >
+                  New Folder
+                </button>
+                {contextMenuFolderPath ? (
+                  <button
+                    type="button"
+                    onClick={() => void duplicateFolderAt(contextMenuFolderPath)}
+                    className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                  >
+                    Duplicate Folder
+                  </button>
+                ) : null}
+                {contextMenuFolderPath ? (
+                  <button
+                    type="button"
+                    onClick={() => void deleteFolderAt(contextMenuFolderPath)}
+                    className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] text-red-300 hover:bg-red-950/50"
+                  >
+                    Delete Folder
+                  </button>
+                ) : null}
+              </>
+            ) : null}
+            {contextMenuItem?.kind === "image" ? (
               <button
                 type="button"
                 onMouseEnter={() => setContextSubmenu("background-remove")}
@@ -1995,7 +2149,7 @@ function App() {
                 {`Animation Preview (${contextMenuSelectionImages.length})`}
               </button>
             ) : null}
-            {contextMenuItem.kind === "video" ? (
+            {contextMenuItem?.kind === "video" ? (
               <button
                 type="button"
                 onMouseEnter={() => setContextSubmenu("extract-frames")}
@@ -2017,33 +2171,52 @@ function App() {
             {contextMenuSelectionItems.length === 1 ? (
               <button
                 type="button"
-                onClick={() => openRenameForItem(contextMenuItem)}
+                onClick={() => {
+                  if (contextMenuItem) {
+                    void duplicateItem(contextMenuItem);
+                  }
+                }}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                Duplicate
+              </button>
+            ) : null}
+            {contextMenuSelectionItems.length === 1 ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (contextMenuItem) {
+                    openRenameForItem(contextMenuItem);
+                  }
+                }}
                 className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
               >
                 Rename
               </button>
             ) : null}
-            <button
-              type="button"
-              onClick={() => {
-                setContextSubmenu(null);
-                setContextMenu(null);
-                if (contextMenuSelectionItems.length > 1) {
-                  void deleteSelectedItems();
-                  return;
-                }
-                setActiveId(contextMenuItem.id);
-                void deleteItem(contextMenuItem);
-              }}
-              className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] text-red-300 hover:bg-red-950/50"
-            >
-              {contextMenuSelectionItems.length > 1
-                ? `Delete Selected (${contextMenuSelectionItems.length})`
-                : "Delete"}
-            </button>
+            {contextMenuItem ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setContextSubmenu(null);
+                  setContextMenu(null);
+                  if (contextMenuSelectionItems.length > 1) {
+                    void deleteSelectedItems();
+                    return;
+                  }
+                  setActiveId(contextMenuItem.id);
+                  void deleteItem(contextMenuItem);
+                }}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] text-red-300 hover:bg-red-950/50"
+              >
+                {contextMenuSelectionItems.length > 1
+                  ? `Delete Selected (${contextMenuSelectionItems.length})`
+                  : "Delete"}
+              </button>
+            ) : null}
           </div>
 
-          {contextMenuItem.kind === "image" && contextSubmenu === "background-remove" ? (
+          {contextMenuItem?.kind === "image" && contextSubmenu === "background-remove" ? (
             <div
               className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
               style={{
@@ -2071,7 +2244,7 @@ function App() {
               ))}
             </div>
           ) : null}
-          {contextMenuItem.kind === "video" && contextSubmenu === "extract-frames" ? (
+          {contextMenuItem?.kind === "video" && contextSubmenu === "extract-frames" ? (
             <div
               className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
               style={{

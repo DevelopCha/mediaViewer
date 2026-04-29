@@ -323,6 +323,55 @@ fn unique_output_file(parent: &Path, base_name: &str, extension: &str) -> PathBu
     candidate
 }
 
+fn unique_named_path(parent: &Path, base_name: &str, extension: Option<&str>) -> PathBuf {
+    let initial_name = match extension {
+        Some(ext) if !ext.is_empty() => format!("{base_name}.{ext}"),
+        _ => base_name.to_string(),
+    };
+    let mut candidate = parent.join(initial_name);
+    let mut index = 2;
+
+    while candidate.exists() {
+        let next_name = match extension {
+            Some(ext) if !ext.is_empty() => format!("{base_name}_{index}.{ext}"),
+            _ => format!("{base_name}_{index}"),
+        };
+        candidate = parent.join(next_name);
+        index += 1;
+    }
+
+    candidate
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| error.to_string())?;
+
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_folder_path(root_path: &str, relative_folder_path: &str) -> PathBuf {
+    let root = PathBuf::from(root_path);
+    if relative_folder_path.is_empty() {
+        return root;
+    }
+
+    relative_folder_path
+        .split('/')
+        .fold(root, |current, segment| current.join(segment))
+}
+
 fn common_parent_dir(paths: &[PathBuf]) -> Option<PathBuf> {
     let first_parent = paths.first()?.parent()?.to_path_buf();
     if paths
@@ -888,6 +937,89 @@ fn delete_media_file(file_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn duplicate_media_file(file_path: String) -> Result<String, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() {
+        return Err("Selected file no longer exists.".to_string());
+    }
+    if !source.is_file() {
+        return Err("Selected path is not a file.".to_string());
+    }
+
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    let extension = source.extension().and_then(|value| value.to_str());
+    let target = unique_named_path(parent, &format!("{stem}_copy"), extension);
+
+    fs::copy(&source, &target).map_err(|error| error.to_string())?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn create_media_folder(root_path: String, relative_folder_path: String) -> Result<String, String> {
+    let parent = resolve_folder_path(&root_path, &relative_folder_path);
+    if !parent.exists() {
+        return Err("Selected folder no longer exists.".to_string());
+    }
+    if !parent.is_dir() {
+        return Err("Selected path is not a folder.".to_string());
+    }
+
+    let target = unique_named_path(&parent, "New Folder", None);
+    fs::create_dir(&target).map_err(|error| error.to_string())?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn duplicate_media_folder(root_path: String, relative_folder_path: String) -> Result<String, String> {
+    if relative_folder_path.is_empty() {
+        return Err("The root folder cannot be duplicated.".to_string());
+    }
+
+    let source = resolve_folder_path(&root_path, &relative_folder_path);
+    if !source.exists() {
+        return Err("Selected folder no longer exists.".to_string());
+    }
+    if !source.is_dir() {
+        return Err("Selected path is not a folder.".to_string());
+    }
+
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the folder name.".to_string())?;
+    let target = unique_named_path(parent, &format!("{name}_copy"), None);
+
+    copy_dir_recursive(&source, &target)?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn delete_media_folder(root_path: String, relative_folder_path: String) -> Result<(), String> {
+    if relative_folder_path.is_empty() {
+        return Err("The root folder cannot be deleted.".to_string());
+    }
+
+    let source = resolve_folder_path(&root_path, &relative_folder_path);
+    if !source.exists() {
+        return Err("Selected folder no longer exists.".to_string());
+    }
+    if !source.is_dir() {
+        return Err("Selected path is not a folder.".to_string());
+    }
+
+    fs::remove_dir_all(source).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn enqueue_remove_image_background(
     app: AppHandle,
     state: State<'_, BackgroundRemovalState>,
@@ -1092,6 +1224,10 @@ pub fn run() {
             scan_media_folder,
             rename_media_file,
             delete_media_file,
+            duplicate_media_file,
+            create_media_folder,
+            duplicate_media_folder,
+            delete_media_folder,
             enqueue_remove_image_background,
             enqueue_extract_video_frames,
             export_image_sequence_animation,
