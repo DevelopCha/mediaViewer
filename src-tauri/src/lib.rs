@@ -274,13 +274,61 @@ fn remove_bg_output_path(source: &Path) -> Result<PathBuf, String> {
     Ok(candidate)
 }
 
-fn large_image_warning(source: &Path) -> Option<String> {
+fn unique_child_dir(parent: &Path, base_name: &str) -> PathBuf {
+    let mut candidate = parent.join(base_name);
+    let mut index = 2;
+
+    while candidate.exists() {
+        candidate = parent.join(format!("{base_name}_{index}"));
+        index += 1;
+    }
+
+    candidate
+}
+
+fn extract_frames_output_dir(source: &Path) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+
+    Ok(unique_child_dir(parent, stem))
+}
+
+fn unique_output_file(parent: &Path, base_name: &str, extension: &str) -> PathBuf {
+    let mut candidate = parent.join(format!("{base_name}.{extension}"));
+    let mut index = 2;
+
+    while candidate.exists() {
+        candidate = parent.join(format!("{base_name}_{index}.{extension}"));
+        index += 1;
+    }
+
+    candidate
+}
+
+fn common_parent_dir(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first_parent = paths.first()?.parent()?.to_path_buf();
+    if paths
+        .iter()
+        .all(|path| path.parent().is_some_and(|parent| parent == first_parent))
+    {
+        Some(first_parent)
+    } else {
+        None
+    }
+}
+
+fn large_media_warning(source: &Path) -> Option<String> {
     let metadata = fs::metadata(source).ok()?;
     if metadata.len() < LARGE_IMAGE_WARNING_BYTES {
         return None;
     }
 
-    Some("Large image detected. This may take longer and use more memory.".to_string())
+    Some("Large file detected. This may take longer and use more memory.".to_string())
 }
 
 fn scan_folder(root: &Path) -> Result<ScanResult, String> {
@@ -386,7 +434,7 @@ fn enqueue_background_task(
     engine_label: String,
 ) -> Result<BackgroundTask, String> {
     let output_path = remove_bg_output_path(source)?;
-    let warning = large_image_warning(source);
+    let warning = large_media_warning(source);
     let file_name = source
         .file_name()
         .and_then(|value| value.to_str())
@@ -472,6 +520,202 @@ fn perform_background_removal_with_engine(
     .map_err(|error| format!("Background removal failed. {error}"))
 }
 
+fn detect_ffmpeg_binary(name: &str) -> Result<String, String> {
+    let output = Command::new(name)
+        .arg("-version")
+        .output()
+        .map_err(|_| format!("{name} was not found. Install FFmpeg to extract video frames."))?;
+
+    if output.status.success() {
+        Ok(name.to_string())
+    } else {
+        Err(format!("{name} is not available. Install FFmpeg to extract video frames."))
+    }
+}
+
+fn video_duration_seconds(source: &Path) -> Result<f64, String> {
+    let ffprobe = detect_ffmpeg_binary("ffprobe")?;
+    let args = vec![
+        "-v".to_string(),
+        "error".to_string(),
+        "-show_entries".to_string(),
+        "format=duration".to_string(),
+        "-of".to_string(),
+        "default=noprint_wrappers=1:nokey=1".to_string(),
+        source.to_string_lossy().to_string(),
+    ];
+
+    let output = Command::new(&ffprobe)
+        .args(&args)
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    value
+        .parse::<f64>()
+        .map_err(|_| "Failed to read the video duration.".to_string())
+}
+
+fn frame_extraction_filter(preset_key: &str, duration_seconds: f64) -> Result<String, String> {
+    let safe_duration = duration_seconds.max(0.1);
+    let filter = match preset_key {
+        "summary_recommended" => {
+            let target_frames = if safe_duration <= 30.0 {
+                6
+            } else if safe_duration <= 300.0 {
+                12
+            } else if safe_duration <= 1800.0 {
+                24
+            } else if safe_duration <= 10800.0 {
+                48
+            } else {
+                60
+            };
+            format!("fps={:.8}", (target_frames as f64 / safe_duration).max(0.001))
+        }
+        "summary_12" => format!("fps={:.8}", (12.0 / safe_duration).max(0.001)),
+        "summary_24" => format!("fps={:.8}", (24.0 / safe_duration).max(0.001)),
+        "summary_60" => format!("fps={:.8}", (60.0 / safe_duration).max(0.001)),
+        "interval_5s" => "fps=1/5".to_string(),
+        "interval_30s" => "fps=1/30".to_string(),
+        "interval_60s" => "fps=1/60".to_string(),
+        _ => return Err("Unknown frame extraction preset.".to_string()),
+    };
+
+    Ok(filter)
+}
+
+fn perform_frame_extraction(source_path: &str, output_dir: &str, preset_key: &str) -> Result<(), String> {
+    let source = PathBuf::from(source_path);
+    let output = PathBuf::from(output_dir);
+    let ffmpeg = detect_ffmpeg_binary("ffmpeg")?;
+    let duration_seconds = video_duration_seconds(&source)?;
+    let fps_filter = frame_extraction_filter(preset_key, duration_seconds)?;
+
+    fs::create_dir_all(&output).map_err(|error| error.to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("frame");
+    let output_pattern = output.join(format!("{stem}_%04d.png"));
+
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        source.to_string_lossy().to_string(),
+        "-vf".to_string(),
+        fps_filter,
+        "-vsync".to_string(),
+        "vfr".to_string(),
+        "-q:v".to_string(),
+        "1".to_string(),
+        output_pattern.to_string_lossy().to_string(),
+    ];
+
+    run_command(&ffmpeg, &args, &output)
+        .map_err(|error| format!("Frame extraction failed. {error}"))
+}
+
+fn export_animation_from_images(
+    image_paths: &[String],
+    format: &str,
+    fps: u32,
+) -> Result<String, String> {
+    if image_paths.len() < 2 {
+        return Err("Select at least two images to export an animation.".to_string());
+    }
+
+    if !matches!(format, "gif" | "webp") {
+        return Err("Unsupported animation format.".to_string());
+    }
+
+    let ffmpeg = detect_ffmpeg_binary("ffmpeg")?;
+    let paths: Vec<PathBuf> = image_paths.iter().map(PathBuf::from).collect();
+    let parent_dir = common_parent_dir(&paths)
+        .or_else(|| paths.first().and_then(|path| path.parent()).map(Path::to_path_buf))
+        .ok_or_else(|| "Could not resolve the output folder.".to_string())?;
+    let base_name = parent_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("animation");
+    let output_path = unique_output_file(&parent_dir, base_name, format);
+    let frame_duration = 1.0 / fps.max(1) as f64;
+
+    let mut list_content = String::new();
+    for image_path in &paths {
+        let safe_path = image_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
+        list_content.push_str(&format!("file '{}'\n", safe_path));
+        list_content.push_str(&format!("duration {:.6}\n", frame_duration));
+    }
+    if let Some(last_path) = paths.last() {
+        let safe_path = last_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "'\\''");
+        list_content.push_str(&format!("file '{}'\n", safe_path));
+    }
+
+    let list_path = std::env::temp_dir().join(format!("media-vault-animation-{}.txt", now_ms()));
+    fs::write(&list_path, list_content).map_err(|error| error.to_string())?;
+
+    let result = (|| {
+        let mut args = vec![
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-f".to_string(),
+            "concat".to_string(),
+            "-safe".to_string(),
+            "0".to_string(),
+            "-i".to_string(),
+            list_path.to_string_lossy().to_string(),
+        ];
+
+        if format == "gif" {
+            args.extend([
+                "-filter_complex".to_string(),
+                format!(
+                    "fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+                ),
+                "-loop".to_string(),
+                "0".to_string(),
+                output_path.to_string_lossy().to_string(),
+            ]);
+        } else {
+            args.extend([
+                "-loop".to_string(),
+                "0".to_string(),
+                "-c:v".to_string(),
+                "libwebp_anim".to_string(),
+                "-quality".to_string(),
+                "90".to_string(),
+                "-lossless".to_string(),
+                "0".to_string(),
+                "-pix_fmt".to_string(),
+                "yuva420p".to_string(),
+                output_path.to_string_lossy().to_string(),
+            ]);
+        }
+
+        run_command(&ffmpeg, &args, &parent_dir)
+    })();
+
+    let _ = fs::remove_file(&list_path);
+    result
+        .map(|_| output_path.to_string_lossy().to_string())
+        .map_err(|error| format!("Animation export failed. {error}"))
+}
+
 fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQueue>>) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -520,8 +764,10 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
             let source_path = task.source_path.clone();
             let output_path = task.output_path.clone();
             let engine_key = task.engine_key.clone();
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                perform_background_removal_with_engine(&source_path, &output_path, &engine_key)
+            let task_kind = task.kind.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || match task_kind.as_str() {
+                "extractFrames" => perform_frame_extraction(&source_path, &output_path, &engine_key),
+                _ => perform_background_removal_with_engine(&source_path, &output_path, &engine_key),
             })
             .await
             .map_err(|error| error.to_string())
@@ -529,24 +775,34 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
 
             match result {
                 Ok(()) => {
+                    let success_message = if task.kind == "extractFrames" {
+                        "Frames extracted."
+                    } else {
+                        "Background removed."
+                    };
                     update_task(
                         &tasks,
                         &app,
                         &task.id,
                         "completed",
                         100,
-                        "Background removed.",
+                        success_message,
                         None,
                     );
                 }
                 Err(error) => {
+                    let failure_message = if task.kind == "extractFrames" {
+                        "Frame extraction failed."
+                    } else {
+                        "Background removal failed."
+                    };
                     update_task(
                         &tasks,
                         &app,
                         &task.id,
                         "failed",
                         100,
-                        "Background removal failed.",
+                        failure_message,
                         Some(error),
                     );
                 }
@@ -653,6 +909,115 @@ fn list_background_tasks(state: State<'_, BackgroundRemovalState>) -> Vec<Backgr
 }
 
 #[tauri::command]
+fn enqueue_extract_video_frames(
+    app: AppHandle,
+    state: State<'_, BackgroundRemovalState>,
+    file_path: String,
+    preset_key: String,
+) -> Result<BackgroundTask, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() {
+        return Err("Selected file no longer exists.".to_string());
+    }
+    if !source.is_file() {
+        return Err("Selected path is not a file.".to_string());
+    }
+
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{}", value.to_lowercase()))
+        .unwrap_or_default();
+    if media_kind_for_extension(&extension) != Some("video") {
+        return Err("Frame extraction is only available for videos.".to_string());
+    }
+
+    detect_ffmpeg_binary("ffmpeg")?;
+    detect_ffmpeg_binary("ffprobe")?;
+
+    let output_dir = extract_frames_output_dir(&source)?;
+    let preset_label = match preset_key.as_str() {
+        "summary_recommended" => "Recommended Summary",
+        "summary_12" => "Summary 12 Frames",
+        "summary_24" => "Summary 24 Frames",
+        "summary_60" => "Summary 60 Frames",
+        "interval_5s" => "Every 5 Seconds",
+        "interval_30s" => "Every 30 Seconds",
+        "interval_60s" => "Every 1 Minute",
+        _ => return Err("Unknown frame extraction preset.".to_string()),
+    }
+    .to_string();
+
+    let created_at_ms = now_ms();
+    let warning = large_media_warning(&source);
+    let file_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("video")
+        .to_string();
+
+    let (task, should_start_worker) = {
+        let mut queue = state.inner.lock().unwrap();
+        if queue.active_count() >= MAX_ACTIVE_BACKGROUND_TASKS {
+            return Err(format!(
+                "Background task queue is full. Wait for one of the {MAX_ACTIVE_BACKGROUND_TASKS} tasks to finish."
+            ));
+        }
+
+        let task_id = format!("bg-remove-{}", queue.next_id);
+        queue.next_id += 1;
+
+        let task = BackgroundTask {
+            id: task_id.clone(),
+            kind: "extractFrames".to_string(),
+            engine_key: preset_key,
+            engine_label: preset_label,
+            source_path: source.to_string_lossy().to_string(),
+            output_path: output_dir.to_string_lossy().to_string(),
+            file_name,
+            status: "queued".to_string(),
+            progress: 0,
+            message: "Waiting in queue...".to_string(),
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            error: None,
+            warning,
+        };
+
+        queue.pending.push_back(task_id.clone());
+        queue.order.push(task_id.clone());
+        queue.tasks.insert(task_id, task.clone());
+        queue.prune_history();
+
+        let should_start_worker = if queue.worker_running {
+            false
+        } else {
+            queue.worker_running = true;
+            true
+        };
+
+        (task, should_start_worker)
+    };
+
+    emit_task_update(&app, &task);
+
+    if should_start_worker {
+        spawn_background_worker(app.clone(), state.inner.clone());
+    }
+
+    Ok(task)
+}
+
+#[tauri::command]
+fn export_image_sequence_animation(
+    image_paths: Vec<String>,
+    format: String,
+    fps: u32,
+) -> Result<String, String> {
+    export_animation_from_images(&image_paths, &format, fps)
+}
+
+#[tauri::command]
 fn cancel_background_task(
     app: AppHandle,
     state: State<'_, BackgroundRemovalState>,
@@ -718,6 +1083,8 @@ pub fn run() {
             rename_media_file,
             delete_media_file,
             enqueue_remove_image_background,
+            enqueue_extract_video_frames,
+            export_image_sequence_animation,
             list_background_tasks,
             cancel_background_task,
             clear_finished_background_tasks

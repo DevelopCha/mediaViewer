@@ -124,7 +124,16 @@ function backgroundTaskProgressLabel(task: BackgroundTask) {
 }
 
 type BackgroundEngineKey = "anime" | "real" | "bria" | "withoutbg";
-type ContextSubmenu = "background-remove" | null;
+type FrameExtractPresetKey =
+  | "summary_recommended"
+  | "summary_12"
+  | "summary_24"
+  | "summary_60"
+  | "interval_5s"
+  | "interval_30s"
+  | "interval_60s";
+type AnimationExportFormat = "gif" | "webp";
+type ContextSubmenu = "background-remove" | "extract-frames" | null;
 
 const BACKGROUND_ENGINES: Array<{
   key: BackgroundEngineKey;
@@ -134,6 +143,19 @@ const BACKGROUND_ENGINES: Array<{
   { key: "real", label: "ISNet General (Real)" },
   { key: "bria", label: "BRIA RMBG (Real)" },
   { key: "withoutbg", label: "withoutBG (HQ)" },
+];
+
+const FRAME_EXTRACT_PRESETS: Array<{
+  key: FrameExtractPresetKey;
+  label: string;
+}> = [
+  { key: "summary_recommended", label: "Recommended Summary" },
+  { key: "summary_12", label: "Summary 12 Frames" },
+  { key: "summary_24", label: "Summary 24 Frames" },
+  { key: "summary_60", label: "Summary 60 Frames" },
+  { key: "interval_5s", label: "Every 5 Seconds" },
+  { key: "interval_30s", label: "Every 30 Seconds" },
+  { key: "interval_60s", label: "Every 1 Minute" },
 ];
 
 const VideoThumb = memo(function VideoThumb({
@@ -458,6 +480,14 @@ function App() {
   const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
   const [tasksPanelOpen, setTasksPanelOpen] = useState(true);
+  const [animationPreviewOpen, setAnimationPreviewOpen] = useState(false);
+  const [animationPreviewFrameIds, setAnimationPreviewFrameIds] = useState<string[]>([]);
+  const [animationPreviewIndex, setAnimationPreviewIndex] = useState(0);
+  const [animationPreviewPlaying, setAnimationPreviewPlaying] = useState(true);
+  const [animationPreviewLoop, setAnimationPreviewLoop] = useState(true);
+  const [animationPreviewFps, setAnimationPreviewFps] = useState(6);
+  const [animationExporting, setAnimationExporting] = useState(false);
+  const [animationContextMenu, setAnimationContextMenu] = useState<{ x: number; y: number } | null>(null);
   const explorerRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{
     startX: number;
@@ -526,6 +556,10 @@ function App() {
   const selectedItems = useMemo(
     () => items.filter((item) => selectedItemIds.has(item.id)),
     [items, selectedItemIds],
+  );
+  const selectedVideoItems = useMemo(
+    () => selectedItems.filter((item) => item.kind === "video"),
+    [selectedItems],
   );
   const selectedItemCount = selectedItems.length;
 
@@ -770,6 +804,57 @@ function App() {
     }
   }
 
+  async function handleExtractFrames(item: MediaItem, presetKey: FrameExtractPresetKey) {
+    if (!rootPath) return;
+    if (item.kind !== "video") {
+      setErrorMessage("Frame extraction is only available for videos.");
+      setContextMenu(null);
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+
+    try {
+      const task = await invoke<BackgroundTask>("enqueue_extract_video_frames", {
+        filePath: item.path,
+        presetKey,
+      });
+      setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to extract video frames.",
+      );
+    }
+  }
+
+  async function handleExtractFramesSelected(presetKey: FrameExtractPresetKey) {
+    if (!rootPath || selectedItems.length === 0) return;
+    if (selectedVideoItems.length === 0) {
+      setErrorMessage("Frame extraction is only available for selected videos.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+
+    try {
+      for (const item of selectedVideoItems) {
+        const task = await invoke<BackgroundTask>("enqueue_extract_video_frames", {
+          filePath: item.path,
+          presetKey,
+        });
+        setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
+      }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to queue video frame extraction.",
+      );
+    }
+  }
+
   async function cancelBackgroundTask(taskId: string) {
     try {
       const task = await invoke<BackgroundTask>("cancel_background_task", { taskId });
@@ -783,14 +868,20 @@ function App() {
 
   async function retryBackgroundTask(task: BackgroundTask) {
     try {
-      const nextTask = await invoke<BackgroundTask>("enqueue_remove_image_background", {
-        filePath: task.sourcePath,
-        engineKey: task.engineKey,
-      });
+      const nextTask =
+        task.kind === "extractFrames"
+          ? await invoke<BackgroundTask>("enqueue_extract_video_frames", {
+              filePath: task.sourcePath,
+              presetKey: task.engineKey,
+            })
+          : await invoke<BackgroundTask>("enqueue_remove_image_background", {
+              filePath: task.sourcePath,
+              engineKey: task.engineKey,
+            });
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, nextTask));
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "Failed to retry the background task.",
+        error instanceof Error ? error.message : "Failed to retry the queued task.",
       );
     }
   }
@@ -948,6 +1039,14 @@ function App() {
       .filter((item): item is MediaItem => item !== null);
   }, [isSearchMode, items, sortedTreeItems, visibleTreeEntries]);
 
+  const animationPreviewItems = useMemo(() => {
+    const frameSet = new Set(animationPreviewFrameIds);
+    return selectionOrderedItems.filter((item) => frameSet.has(item.id) && item.kind === "image");
+  }, [animationPreviewFrameIds, selectionOrderedItems]);
+
+  const currentAnimationFrame = animationPreviewItems[animationPreviewIndex] ?? null;
+  const currentAnimationFrameUrl = currentAnimationFrame ? assetUrl(currentAnimationFrame.path) : "";
+
   function toggleFolderExpanded(path: string) {
     setExpandedFolderPaths((prev) => {
       const next = new Set(prev);
@@ -1012,6 +1111,53 @@ function App() {
       itemId: item.id,
     });
     setContextSubmenu(null);
+  }
+
+  function openAnimationPreview(itemsToPreview: MediaItem[]) {
+    const previewIds = selectionOrderedItems
+      .filter((item) => itemsToPreview.some((candidate) => candidate.id === item.id) && item.kind === "image")
+      .map((item) => item.id);
+
+    if (previewIds.length < 2) {
+      setErrorMessage("Animation preview needs at least two selected images.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setAnimationContextMenu(null);
+    setAnimationPreviewFrameIds(previewIds);
+    setAnimationPreviewIndex(0);
+    setAnimationPreviewPlaying(true);
+    setAnimationPreviewLoop(true);
+    setAnimationPreviewFps(6);
+    setAnimationPreviewOpen(true);
+  }
+
+  async function exportAnimationFromPreview(format: AnimationExportFormat) {
+    if (animationPreviewItems.length < 2) return;
+
+    setAnimationExporting(true);
+    setAnimationContextMenu(null);
+    setErrorMessage("");
+
+    try {
+      const outputPath = await invoke<string>("export_image_sequence_animation", {
+        imagePaths: animationPreviewItems.map((item) => item.path),
+        format,
+        fps: animationPreviewFps,
+      });
+      if (rootPath) {
+        await loadFolder(rootPath, outputPath, { preserveSelection: true });
+      }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to export the animation preview.",
+      );
+    } finally {
+      setAnimationExporting(false);
+    }
   }
 
   function handleTreeFileSelect(event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) {
@@ -1143,6 +1289,16 @@ function App() {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
+        if (animationContextMenu) {
+          event.preventDefault();
+          setAnimationContextMenu(null);
+          return;
+        }
+        if (animationPreviewOpen) {
+          event.preventDefault();
+          setAnimationPreviewOpen(false);
+          return;
+        }
         if (contextMenu) {
           event.preventDefault();
           setContextMenu(null);
@@ -1161,6 +1317,29 @@ function App() {
         if (viewerExpanded) {
           event.preventDefault();
           setViewerExpanded(false);
+          return;
+        }
+      }
+      if (animationPreviewOpen && animationPreviewItems.length) {
+        if (event.key === " ") {
+          event.preventDefault();
+          setAnimationPreviewPlaying((prev) => !prev);
+          return;
+        }
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          setAnimationPreviewPlaying(false);
+          setAnimationPreviewIndex((prev) =>
+            prev === 0 ? animationPreviewItems.length - 1 : prev - 1,
+          );
+          return;
+        }
+        if (event.key === "ArrowRight") {
+          event.preventDefault();
+          setAnimationPreviewPlaying(false);
+          setAnimationPreviewIndex((prev) =>
+            prev >= animationPreviewItems.length - 1 ? 0 : prev + 1,
+          );
           return;
         }
       }
@@ -1199,6 +1378,9 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     active,
+    animationContextMenu,
+    animationPreviewItems,
+    animationPreviewOpen,
     contextMenu,
     explorerSelection,
     imageZoom,
@@ -1209,6 +1391,54 @@ function App() {
     viewerExpanded,
     visibleTreeEntries,
   ]);
+
+  useEffect(() => {
+    if (!animationPreviewOpen || !animationPreviewPlaying || animationPreviewItems.length < 2) {
+      return;
+    }
+
+    const intervalMs = Math.max(40, Math.round(1000 / Math.max(animationPreviewFps, 1)));
+    const timer = window.setInterval(() => {
+      setAnimationPreviewIndex((prev) => {
+        const next = prev + 1;
+        if (next >= animationPreviewItems.length) {
+          return animationPreviewLoop ? 0 : prev;
+        }
+        return next;
+      });
+    }, intervalMs);
+
+    return () => window.clearInterval(timer);
+  }, [
+    animationPreviewFps,
+    animationPreviewItems.length,
+    animationPreviewLoop,
+    animationPreviewOpen,
+    animationPreviewPlaying,
+  ]);
+
+  useEffect(() => {
+    if (!animationPreviewOpen) {
+      setAnimationContextMenu(null);
+    }
+  }, [animationPreviewOpen]);
+
+  useEffect(() => {
+    if (!animationContextMenu) return;
+
+    function closeAnimationContextMenu() {
+      setAnimationContextMenu(null);
+    }
+
+    window.addEventListener("click", closeAnimationContextMenu);
+    window.addEventListener("scroll", closeAnimationContextMenu, true);
+    window.addEventListener("resize", closeAnimationContextMenu);
+    return () => {
+      window.removeEventListener("click", closeAnimationContextMenu);
+      window.removeEventListener("scroll", closeAnimationContextMenu, true);
+      window.removeEventListener("resize", closeAnimationContextMenu);
+    };
+  }, [animationContextMenu]);
 
   useEffect(() => {
     if (!isDraggingImage) return;
@@ -1284,6 +1514,7 @@ function App() {
         ? [contextMenuItem]
         : [];
   const contextMenuSelectionImages = contextMenuSelectionItems.filter((item) => item.kind === "image");
+  const contextMenuSelectionVideos = contextMenuSelectionItems.filter((item) => item.kind === "video");
   const selectedExplorerKey =
     explorerSelection.type === "file"
       ? `file:${explorerSelection.id}`
@@ -1711,6 +1942,34 @@ function App() {
                 <span className="text-zinc-500">&gt;</span>
               </button>
             ) : null}
+            {contextMenuSelectionImages.length >= 2 ? (
+              <button
+                type="button"
+                onClick={() => openAnimationPreview(contextMenuSelectionImages)}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                {`Animation Preview (${contextMenuSelectionImages.length})`}
+              </button>
+            ) : null}
+            {contextMenuItem.kind === "video" ? (
+              <button
+                type="button"
+                onMouseEnter={() => setContextSubmenu("extract-frames")}
+                onClick={() =>
+                  setContextSubmenu((prev) =>
+                    prev === "extract-frames" ? null : "extract-frames",
+                  )
+                }
+                className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                <span>
+                  {contextMenuSelectionItems.length > 1
+                    ? `Extract Frames for Selected (${contextMenuSelectionVideos.length})`
+                    : "Extract Frames"}
+                </span>
+                <span className="text-zinc-500">&gt;</span>
+              </button>
+            ) : null}
             {contextMenuSelectionItems.length === 1 ? (
               <button
                 type="button"
@@ -1765,7 +2024,163 @@ function App() {
               ))}
             </div>
           ) : null}
+          {contextMenuItem.kind === "video" && contextSubmenu === "extract-frames" ? (
+            <div
+              className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
+              style={{ left: `${contextMenu.x + 182}px`, top: `${contextMenu.y + 34}px` }}
+            >
+              <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-500">
+                Choose Extract Mode
+              </div>
+              {FRAME_EXTRACT_PRESETS.map((preset) => (
+                <button
+                  key={preset.key}
+                  type="button"
+                  onClick={() =>
+                    contextMenuSelectionItems.length > 1
+                      ? void handleExtractFramesSelected(preset.key)
+                      : void handleExtractFrames(contextMenuItem, preset.key)
+                  }
+                  disabled={contextMenuSelectionVideos.length === 0}
+                  className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </>
+      ) : null}
+
+      {animationPreviewOpen && animationPreviewItems.length ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/82 p-4">
+          <div className="relative flex h-[88vh] w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-zinc-800 bg-[#101115] shadow-2xl">
+            <div className="flex items-center justify-between gap-3 border-b border-zinc-800 px-5 py-4">
+              <div className="min-w-0">
+                <div className="truncate text-[16px] font-semibold">Animation Preview</div>
+                <div className="mt-1 truncate text-[11px] text-zinc-500">
+                  {animationPreviewItems.length} frames / {animationPreviewFps} FPS
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAnimationPreviewOpen(false)}
+                  className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[12px] text-zinc-200 hover:bg-zinc-900"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <div className="relative flex-1 overflow-hidden bg-black">
+              {currentAnimationFrame ? (
+                <img
+                  src={currentAnimationFrameUrl}
+                  alt={currentAnimationFrame.name}
+                  className="h-full w-full object-contain"
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setAnimationContextMenu({ x: event.clientX, y: event.clientY });
+                  }}
+                />
+              ) : null}
+            </div>
+
+            <div className="border-t border-zinc-800 px-5 py-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAnimationPreviewPlaying((prev) => !prev)}
+                  className="rounded-lg bg-white px-3 py-2 text-[12px] font-semibold text-zinc-950"
+                >
+                  {animationPreviewPlaying ? "Pause" : "Play"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAnimationPreviewPlaying(false);
+                    setAnimationPreviewIndex((prev) =>
+                      prev === 0 ? animationPreviewItems.length - 1 : prev - 1,
+                    );
+                  }}
+                  className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[12px] hover:bg-zinc-900"
+                >
+                  Prev
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAnimationPreviewPlaying(false);
+                    setAnimationPreviewIndex((prev) =>
+                      prev >= animationPreviewItems.length - 1 ? 0 : prev + 1,
+                    );
+                  }}
+                  className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[12px] hover:bg-zinc-900"
+                >
+                  Next
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAnimationPreviewLoop((prev) => !prev)}
+                  className={classNames(
+                    "rounded-lg border px-3 py-2 text-[12px]",
+                    animationPreviewLoop
+                      ? "border-emerald-700 bg-emerald-950/50 text-emerald-200"
+                      : "border-zinc-800 bg-zinc-950 hover:bg-zinc-900",
+                  )}
+                >
+                  {animationPreviewLoop ? "Loop On" : "Loop Off"}
+                </button>
+                <div className="ml-2 flex min-w-[220px] items-center gap-3">
+                  <span className="text-[11px] text-zinc-500">FPS</span>
+                  <input
+                    type="range"
+                    min={1}
+                    max={24}
+                    value={animationPreviewFps}
+                    onChange={(event) => setAnimationPreviewFps(Number(event.target.value))}
+                    className="w-full accent-white"
+                  />
+                  <span className="w-8 text-right text-[11px] font-semibold text-zinc-200">
+                    {animationPreviewFps}
+                  </span>
+                </div>
+                <div className="ml-auto text-[11px] text-zinc-500">
+                  Frame {Math.min(animationPreviewIndex + 1, animationPreviewItems.length)} /{" "}
+                  {animationPreviewItems.length}
+                </div>
+              </div>
+              <div className="mt-2 text-[11px] text-zinc-500">
+                Right-click the preview image to export as GIF or WebP.
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {animationContextMenu && animationPreviewOpen ? (
+        <div
+          className="fixed z-[61] min-w-44 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
+          style={{ left: `${animationContextMenu.x}px`, top: `${animationContextMenu.y}px` }}
+        >
+          <button
+            type="button"
+            onClick={() => void exportAnimationFromPreview("gif")}
+            disabled={animationExporting}
+            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900 disabled:cursor-wait disabled:opacity-60"
+          >
+            {animationExporting ? "Exporting..." : "Export as GIF"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void exportAnimationFromPreview("webp")}
+            disabled={animationExporting}
+            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900 disabled:cursor-wait disabled:opacity-60"
+          >
+            {animationExporting ? "Exporting..." : "Export as WebP"}
+          </button>
+        </div>
       ) : null}
 
       {renameOpen && active ? (
