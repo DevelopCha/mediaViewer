@@ -52,6 +52,7 @@ type BackgroundTask = {
 const IMAGE_ZOOM_MIN = 0.5;
 const IMAGE_ZOOM_MAX = 6;
 const IMAGE_ZOOM_STEP = 0.2;
+const ANIMATION_PREVIEW_FPS_MAX = 120;
 const LIST_ITEM_HEIGHT = 62;
 const DEFAULT_FOLDER_WIDTH = 276;
 const MIN_FOLDER_WIDTH = 220;
@@ -125,13 +126,12 @@ function backgroundTaskProgressLabel(task: BackgroundTask) {
 
 type BackgroundEngineKey = "anime" | "real" | "bria" | "withoutbg";
 type FrameExtractPresetKey =
-  | "summary_recommended"
   | "summary_12"
   | "summary_24"
   | "summary_60"
-  | "interval_5s"
-  | "interval_30s"
-  | "interval_60s";
+  | "fps_30"
+  | "fps_45"
+  | "fps_60";
 type AnimationExportFormat = "gif" | "webp";
 type ContextSubmenu = "background-remove" | "extract-frames" | null;
 
@@ -149,13 +149,12 @@ const FRAME_EXTRACT_PRESETS: Array<{
   key: FrameExtractPresetKey;
   label: string;
 }> = [
-  { key: "summary_recommended", label: "Recommended Summary" },
   { key: "summary_12", label: "Summary 12 Frames" },
   { key: "summary_24", label: "Summary 24 Frames" },
   { key: "summary_60", label: "Summary 60 Frames" },
-  { key: "interval_5s", label: "Every 5 Seconds" },
-  { key: "interval_30s", label: "Every 30 Seconds" },
-  { key: "interval_60s", label: "Every 1 Minute" },
+  { key: "fps_30", label: "Animation Extract 30 FPS" },
+  { key: "fps_45", label: "Animation Extract 45 FPS" },
+  { key: "fps_60", label: "Animation Extract 60 FPS" },
 ];
 
 const VideoThumb = memo(function VideoThumb({
@@ -1397,7 +1396,7 @@ function App() {
       return;
     }
 
-    const intervalMs = Math.max(40, Math.round(1000 / Math.max(animationPreviewFps, 1)));
+    const intervalMs = Math.max(8, Math.round(1000 / Math.max(animationPreviewFps, 1)));
     const timer = window.setInterval(() => {
       setAnimationPreviewIndex((prev) => {
         const next = prev + 1;
@@ -2137,7 +2136,7 @@ function App() {
                   <input
                     type="range"
                     min={1}
-                    max={24}
+                    max={ANIMATION_PREVIEW_FPS_MAX}
                     value={animationPreviewFps}
                     onChange={(event) => setAnimationPreviewFps(Number(event.target.value))}
                     className="w-full accent-white"

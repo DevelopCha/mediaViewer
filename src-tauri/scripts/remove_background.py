@@ -41,23 +41,30 @@ def pick_model(source: Path, requested_model: str) -> tuple[str, bool]:
 
 def run_rembg(data: bytes, source: Path, requested_model: str) -> bytes:
     model_name, use_alpha_matting = pick_model(source, requested_model)
-    session = new_session(model_name)
+    fallback_model = "isnet-anime" if requested_model == "anime" else "isnet-general-use"
 
-    try:
-        if use_alpha_matting:
-            return remove(
-                data,
-                session=session,
-                alpha_matting=True,
-                alpha_matting_foreground_threshold=235,
-                alpha_matting_background_threshold=12,
-                alpha_matting_erode_size=4,
-                post_process_mask=True,
-            )
+    for candidate_model in [model_name, fallback_model]:
+        session = new_session(candidate_model)
+        try:
+            if use_alpha_matting:
+                return remove(
+                    data,
+                    session=session,
+                    alpha_matting=True,
+                    alpha_matting_foreground_threshold=235,
+                    alpha_matting_background_threshold=12,
+                    alpha_matting_erode_size=4,
+                    post_process_mask=True,
+                )
 
-        return remove(data, session=session, post_process_mask=True)
-    except Exception:
-        return remove(data, session=session, post_process_mask=True)
+            return remove(data, session=session, post_process_mask=True)
+        except Exception:
+            try:
+                return remove(data, session=session, post_process_mask=True)
+            except Exception:
+                continue
+
+    raise RuntimeError("All background-removal model attempts failed.")
 
 
 def run_withoutbg(source: Path, target: Path) -> None:
@@ -115,8 +122,11 @@ def main() -> int:
     requested_model = sys.argv[3] if len(sys.argv) > 3 else "auto"
 
     if requested_model == "withoutbg":
-        run_withoutbg(source, target)
-        return 0
+        try:
+            run_withoutbg(source, target)
+            return 0
+        except Exception:
+            requested_model = "real"
 
     data = source.read_bytes()
     result = run_rembg(data, source, requested_model)

@@ -1,7 +1,10 @@
+use chrono::Local;
 use rfd::FileDialog;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -9,9 +12,10 @@ use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 const BACKGROUND_TASK_EVENT: &str = "background-task-updated";
-const MAX_ACTIVE_BACKGROUND_TASKS: usize = 12;
 const MAX_BACKGROUND_TASK_HISTORY: usize = 30;
 const LARGE_IMAGE_WARNING_BYTES: u64 = 12 * 1024 * 1024;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,13 +88,6 @@ impl BackgroundRemovalQueue {
             .collect()
     }
 
-    fn active_count(&self) -> usize {
-        self.tasks
-            .values()
-            .filter(|task| matches!(task.status.as_str(), "queued" | "running"))
-            .count()
-    }
-
     fn prune_history(&mut self) {
         while self.order.len() > MAX_BACKGROUND_TASK_HISTORY {
             let Some(oldest_id) = self.order.first().cloned() else {
@@ -145,6 +142,13 @@ fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn silent_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
 fn detect_python_launcher() -> Result<(String, Vec<String>), String> {
     let candidates = [
         ("py", vec!["-3".to_string(), "--version".to_string()]),
@@ -152,7 +156,7 @@ fn detect_python_launcher() -> Result<(String, Vec<String>), String> {
     ];
 
     for (program, args) in candidates {
-        let output = Command::new(program).args(&args).output();
+        let output = silent_command(program).args(&args).output();
         if let Ok(output) = output {
             if output.status.success() {
                 let run_args = if program == "py" {
@@ -181,7 +185,7 @@ fn rembg_python_path() -> PathBuf {
 }
 
 fn run_command(program: &str, args: &[String], working_dir: &Path) -> Result<(), String> {
-    let output = Command::new(program)
+    let output = silent_command(program)
         .args(args)
         .current_dir(working_dir)
         .output()
@@ -234,6 +238,8 @@ fn ensure_rembg_python() -> Result<PathBuf, String> {
             "--disable-pip-version-check".to_string(),
             "rembg==2.0.66".to_string(),
             "onnxruntime".to_string(),
+            "pillow".to_string(),
+            "huggingface_hub".to_string(),
             "withoutbg".to_string(),
         ];
 
@@ -255,6 +261,18 @@ fn is_remove_bg_supported_image(path: &Path) -> bool {
     )
 }
 
+fn numbered_child_dir(parent: &Path, base_name: &str) -> PathBuf {
+    let mut index = 1;
+    let mut candidate = parent.join(format!("{base_name}_{index}"));
+
+    while candidate.exists() {
+        index += 1;
+        candidate = parent.join(format!("{base_name}_{index}"));
+    }
+
+    candidate
+}
+
 fn remove_bg_output_path(source: &Path) -> Result<PathBuf, String> {
     let parent = source
         .parent()
@@ -263,15 +281,10 @@ fn remove_bg_output_path(source: &Path) -> Result<PathBuf, String> {
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| "Could not resolve the file name.".to_string())?;
-    let mut candidate = parent.join(format!("{stem}_rmbg.png"));
-    let mut index = 2;
+    let folder_prefix = format!("rmbg_{}", Local::now().format("%Y%m%d"));
+    let output_dir = numbered_child_dir(parent, &folder_prefix);
 
-    while candidate.exists() {
-        candidate = parent.join(format!("{stem}_rmbg_{index}.png"));
-        index += 1;
-    }
-
-    Ok(candidate)
+    Ok(output_dir.join(format!("{stem}_rmbg.png")))
 }
 
 fn unique_child_dir(parent: &Path, base_name: &str) -> PathBuf {
@@ -444,12 +457,6 @@ fn enqueue_background_task(
 
     let (task, should_start_worker) = {
         let mut queue = queue_state.lock().unwrap();
-        if queue.active_count() >= MAX_ACTIVE_BACKGROUND_TASKS {
-            return Err(format!(
-                "Background task queue is full. Wait for one of the {MAX_ACTIVE_BACKGROUND_TASKS} tasks to finish."
-            ));
-        }
-
         let task_id = format!("bg-remove-{}", queue.next_id);
         queue.next_id += 1;
 
@@ -500,6 +507,20 @@ fn perform_background_removal_with_engine(
     engine_key: &str,
 ) -> Result<(), String> {
     let source = PathBuf::from(source_path);
+    let output = PathBuf::from(output_path);
+    let output_dir = output
+        .parent()
+        .ok_or_else(|| "Could not resolve the output folder.".to_string())?;
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| "Could not resolve the source file name.".to_string())?;
+    let copied_source = output_dir.join(source_name);
+    let created_dir = !output_dir.exists();
+
+    fs::create_dir_all(output_dir).map_err(|error| error.to_string())?;
+    fs::copy(&source, &copied_source)
+        .map_err(|error| format!("Failed to copy the original file. {error}"))?;
+
     let python = ensure_rembg_python()?;
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")
@@ -508,20 +529,30 @@ fn perform_background_removal_with_engine(
     let args = vec![
         script_path.to_string_lossy().to_string(),
         source.to_string_lossy().to_string(),
-        output_path.to_string(),
+        output.to_string_lossy().to_string(),
         engine_key.to_string(),
     ];
 
-    run_command(
+    let result = run_command(
         &python.to_string_lossy(),
         &args,
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-    )
-    .map_err(|error| format!("Background removal failed. {error}"))
+    );
+
+    if let Err(error) = result {
+        let _ = fs::remove_file(&copied_source);
+        let _ = fs::remove_file(&output);
+        if created_dir {
+            let _ = fs::remove_dir(output_dir);
+        }
+        return Err(format!("Background removal failed. {error}"));
+    }
+
+    Ok(())
 }
 
 fn detect_ffmpeg_binary(name: &str) -> Result<String, String> {
-    let output = Command::new(name)
+    let output = silent_command(name)
         .arg("-version")
         .output()
         .map_err(|_| format!("{name} was not found. Install FFmpeg to extract video frames."))?;
@@ -545,7 +576,7 @@ fn video_duration_seconds(source: &Path) -> Result<f64, String> {
         source.to_string_lossy().to_string(),
     ];
 
-    let output = Command::new(&ffprobe)
+    let output = silent_command(&ffprobe)
         .args(&args)
         .output()
         .map_err(|error| error.to_string())?;
@@ -563,26 +594,12 @@ fn video_duration_seconds(source: &Path) -> Result<f64, String> {
 fn frame_extraction_filter(preset_key: &str, duration_seconds: f64) -> Result<String, String> {
     let safe_duration = duration_seconds.max(0.1);
     let filter = match preset_key {
-        "summary_recommended" => {
-            let target_frames = if safe_duration <= 30.0 {
-                6
-            } else if safe_duration <= 300.0 {
-                12
-            } else if safe_duration <= 1800.0 {
-                24
-            } else if safe_duration <= 10800.0 {
-                48
-            } else {
-                60
-            };
-            format!("fps={:.8}", (target_frames as f64 / safe_duration).max(0.001))
-        }
         "summary_12" => format!("fps={:.8}", (12.0 / safe_duration).max(0.001)),
         "summary_24" => format!("fps={:.8}", (24.0 / safe_duration).max(0.001)),
         "summary_60" => format!("fps={:.8}", (60.0 / safe_duration).max(0.001)),
-        "interval_5s" => "fps=1/5".to_string(),
-        "interval_30s" => "fps=1/30".to_string(),
-        "interval_60s" => "fps=1/60".to_string(),
+        "fps_30" => "fps=30".to_string(),
+        "fps_45" => "fps=45".to_string(),
+        "fps_60" => "fps=60".to_string(),
         _ => return Err("Unknown frame extraction preset.".to_string()),
     };
 
@@ -937,13 +954,12 @@ fn enqueue_extract_video_frames(
 
     let output_dir = extract_frames_output_dir(&source)?;
     let preset_label = match preset_key.as_str() {
-        "summary_recommended" => "Recommended Summary",
         "summary_12" => "Summary 12 Frames",
         "summary_24" => "Summary 24 Frames",
         "summary_60" => "Summary 60 Frames",
-        "interval_5s" => "Every 5 Seconds",
-        "interval_30s" => "Every 30 Seconds",
-        "interval_60s" => "Every 1 Minute",
+        "fps_30" => "Animation Extract 30 FPS",
+        "fps_45" => "Animation Extract 45 FPS",
+        "fps_60" => "Animation Extract 60 FPS",
         _ => return Err("Unknown frame extraction preset.".to_string()),
     }
     .to_string();
@@ -958,12 +974,6 @@ fn enqueue_extract_video_frames(
 
     let (task, should_start_worker) = {
         let mut queue = state.inner.lock().unwrap();
-        if queue.active_count() >= MAX_ACTIVE_BACKGROUND_TASKS {
-            return Err(format!(
-                "Background task queue is full. Wait for one of the {MAX_ACTIVE_BACKGROUND_TASKS} tasks to finish."
-            ));
-        }
-
         let task_id = format!("bg-remove-{}", queue.next_id);
         queue.next_id += 1;
 
