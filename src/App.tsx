@@ -2,6 +2,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   memo,
+  startTransition,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type SyntheticEvent,
@@ -86,6 +87,20 @@ function classNames(...xs: Array<string | false | null | undefined>) {
 
 function assetUrl(path: string) {
   return convertFileSrc(path);
+}
+
+function buildItemMaps(items: MediaItem[]) {
+  const byId = new Map<string, MediaItem>();
+  const byPath = new Map<string, MediaItem>();
+  for (const item of items) {
+    byId.set(item.id, item);
+    byPath.set(item.path, item);
+  }
+  return { byId, byPath };
+}
+
+function isArchiveRootPath(path: string) {
+  return path.trim().toLowerCase().endsWith(".zip");
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -582,6 +597,7 @@ function App() {
     startX: number;
     startWidth: number;
   } | null>(null);
+  const backgroundRefreshTimeoutRef = useRef<number | null>(null);
 
   const deferredQuery = useDeferredValue(query);
 
@@ -611,7 +627,7 @@ function App() {
       return;
     }
 
-    const coverItem = findMediaByPath(items, node.coverPath);
+    const coverItem = itemMaps.byPath.get(node.coverPath) ?? null;
     setActiveId(coverItem?.id ?? folderItems[0]?.id ?? null);
   }
 
@@ -641,9 +657,13 @@ function App() {
   );
 
   const filesByFolder = useMemo(() => buildFilesByFolder(sortedTreeItems), [sortedTreeItems]);
+  const itemMaps = useMemo(() => buildItemMaps(items), [items]);
   const selectedItems = useMemo(
-    () => items.filter((item) => selectedItemIds.has(item.id)),
-    [items, selectedItemIds],
+    () =>
+      Array.from(selectedItemIds)
+        .map((id) => itemMaps.byId.get(id) ?? null)
+        .filter((item): item is MediaItem => item !== null),
+    [itemMaps, selectedItemIds],
   );
   const selectedVideoItems = useMemo(
     () => selectedItems.filter((item) => item.kind === "video"),
@@ -651,7 +671,10 @@ function App() {
   );
   const selectedItemCount = selectedItems.length;
 
-  const active = useMemo(() => findMediaById(items, activeId), [items, activeId]);
+  const active = useMemo(
+    () => (activeId ? itemMaps.byId.get(activeId) ?? null : null),
+    [activeId, itemMaps],
+  );
   const resolvedVideoVrLayout = useMemo(
     () => resolveVideoVrLayout(videoVrLayoutSetting, activeVideoDimensions),
     [activeVideoDimensions, videoVrLayoutSetting],
@@ -661,7 +684,8 @@ function App() {
     ? active.relativePath
     : selectedFolderPath
       ? `Showing ${selectedFolderPath}`
-      : "Choose a folder to start browsing.";
+      : "Choose a folder or ZIP archive to start browsing.";
+  const isArchiveRoot = isArchiveRootPath(rootPath);
   const previewSourceUrl = useMemo(
     () => (active ? assetUrl(active.path) : ""),
     [active?.path],
@@ -699,8 +723,14 @@ function App() {
   }, [active?.id, active?.kind]);
 
   const syncBackgroundTaskEffect = useEffectEvent(async (task: BackgroundTask) => {
-    if (task.status === "completed" && rootPath && task.kind !== "extractFrames") {
-      await loadFolder(rootPath, null, { preserveSelection: true });
+    if (task.status === "completed" && rootPath) {
+      if (backgroundRefreshTimeoutRef.current !== null) {
+        window.clearTimeout(backgroundRefreshTimeoutRef.current);
+      }
+      backgroundRefreshTimeoutRef.current = window.setTimeout(() => {
+        backgroundRefreshTimeoutRef.current = null;
+        void loadFolder(rootPath, null, { preserveSelection: true });
+      }, 220);
       return;
     }
 
@@ -728,6 +758,10 @@ function App() {
 
     return () => {
       cancelled = true;
+      if (backgroundRefreshTimeoutRef.current !== null) {
+        window.clearTimeout(backgroundRefreshTimeoutRef.current);
+        backgroundRefreshTimeoutRef.current = null;
+      }
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, [syncBackgroundTaskEffect]);
@@ -744,18 +778,20 @@ function App() {
       const result = await invoke<ScanResult>("scan_media_folder", {
         rootPath: root,
       });
-      setItems(result.items);
-      setRootFolderName(result.rootName);
-      setRootPath(result.rootPath);
-      if (!options?.preserveSelection) {
-        setSelectedFolderPath("");
-        setExplorerSelection({ type: "folder", path: "" });
-      }
+      startTransition(() => {
+        setItems(result.items);
+        setRootFolderName(result.rootName);
+        setRootPath(result.rootPath);
+        if (!options?.preserveSelection) {
+          setSelectedFolderPath("");
+          setExplorerSelection({ type: "folder", path: "" });
+        }
 
-      const preferred = findMediaByPath(result.items, preferredPath ?? null);
-      const fallback =
-        activeId && !preferredPath ? findMediaById(result.items, activeId) : null;
-      setActiveId(preferred?.id ?? fallback?.id ?? result.items[0]?.id ?? null);
+        const preferred = findMediaByPath(result.items, preferredPath ?? null);
+        const fallback =
+          activeId && !preferredPath ? findMediaById(result.items, activeId) : null;
+        setActiveId(preferred?.id ?? fallback?.id ?? result.items[0]?.id ?? null);
+      });
       return result;
     } catch (error) {
       setErrorMessage(
@@ -780,8 +816,32 @@ function App() {
     }
   }
 
+  async function handlePickZipArchive() {
+    setErrorMessage("");
+    try {
+      const selectedArchive = await invoke<string | null>("pick_root_archive");
+      if (!selectedArchive) return;
+      await loadFolder(selectedArchive);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Failed to open the ZIP picker.",
+      );
+    }
+  }
+
+  function ensureWritableRoot(action: string) {
+    if (!isArchiveRoot) {
+      return true;
+    }
+    setErrorMessage(`${action} is disabled while browsing a ZIP archive.`);
+    setContextMenu(null);
+    setContextSubmenu(null);
+    return false;
+  }
+
   async function handleRename() {
     if (!active || !rootPath) return;
+    if (!ensureWritableRoot("Rename")) return;
     setIsSaving(true);
     setErrorMessage("");
 
@@ -803,6 +863,7 @@ function App() {
 
   async function deleteItem(item: MediaItem) {
     if (!rootPath) return;
+    if (!ensureWritableRoot("Delete")) return;
     const confirmed = window.confirm(`Delete "${item.name + item.ext}"?`);
     if (!confirmed) return;
 
@@ -826,6 +887,7 @@ function App() {
 
   async function deleteSelectedItems() {
     if (!rootPath || selectedItems.length === 0) return;
+    if (!ensureWritableRoot("Delete")) return;
     const confirmed = window.confirm(`Delete ${selectedItems.length} selected item(s)?`);
     if (!confirmed) return;
 
@@ -863,6 +925,7 @@ function App() {
 
   async function duplicateItem(item: MediaItem) {
     if (!rootPath) return;
+    if (!ensureWritableRoot("Duplicate")) return;
     setErrorMessage("");
     setContextMenu(null);
 
@@ -880,6 +943,7 @@ function App() {
 
   async function createFolderAt(relativeFolderPath: string) {
     if (!rootPath) return;
+    if (!ensureWritableRoot("Create folder")) return;
     setErrorMessage("");
     setContextMenu(null);
 
@@ -908,6 +972,7 @@ function App() {
 
   async function duplicateFolderAt(relativeFolderPath: string) {
     if (!rootPath || !relativeFolderPath) return;
+    if (!ensureWritableRoot("Duplicate folder")) return;
     setErrorMessage("");
     setContextMenu(null);
 
@@ -936,6 +1001,7 @@ function App() {
 
   async function deleteFolderAt(relativeFolderPath: string) {
     if (!rootPath || !relativeFolderPath) return;
+    if (!ensureWritableRoot("Delete folder")) return;
     const folderLabel = relativeFolderPath.split("/").pop() || relativeFolderPath;
     const confirmed = window.confirm(`Delete folder "${folderLabel}" and everything inside it?`);
     if (!confirmed) return;
@@ -958,6 +1024,7 @@ function App() {
 
   async function handleRemoveBackground(item: MediaItem, engineKey: BackgroundEngineKey) {
     if (!rootPath) return;
+    if (!ensureWritableRoot("Background removal")) return;
     if (item.kind !== "image") {
       setErrorMessage("Background removal is only available for images.");
       setContextMenu(null);
@@ -983,6 +1050,7 @@ function App() {
 
   async function handleRemoveBackgroundSelected(engineKey: BackgroundEngineKey) {
     if (!rootPath || selectedItems.length === 0) return;
+    if (!ensureWritableRoot("Background removal")) return;
 
     const imageItems = selectedItems.filter((item) => item.kind === "image");
     if (imageItems.length === 0) {
@@ -1011,6 +1079,7 @@ function App() {
 
   async function handleExtractFrames(item: MediaItem, presetKey: FrameExtractPresetKey) {
     if (!rootPath) return;
+    if (!ensureWritableRoot("Frame extraction")) return;
     if (item.kind !== "video") {
       setErrorMessage("Frame extraction is only available for videos.");
       setContextMenu(null);
@@ -1038,6 +1107,7 @@ function App() {
 
   async function handleExtractFramesSelected(presetKey: FrameExtractPresetKey) {
     if (!rootPath || selectedItems.length === 0) return;
+    if (!ensureWritableRoot("Frame extraction")) return;
     if (selectedVideoItems.length === 0) {
       setErrorMessage("Frame extraction is only available for selected videos.");
       return;
@@ -1246,9 +1316,9 @@ function App() {
       .map((entry) => entry.id);
 
     return visibleFileIds
-      .map((id) => items.find((item) => item.id === id) ?? null)
+      .map((id) => itemMaps.byId.get(id) ?? null)
       .filter((item): item is MediaItem => item !== null);
-  }, [isSearchMode, items, sortedTreeItems, visibleTreeEntries]);
+  }, [isSearchMode, itemMaps, sortedTreeItems, visibleTreeEntries]);
 
   const animationPreviewItems = useMemo(() => {
     const frameSet = new Set(animationPreviewFrameIds);
@@ -1361,6 +1431,7 @@ function App() {
 
   async function exportAnimationFromPreview(format: AnimationExportFormat) {
     if (animationPreviewItems.length < 2) return;
+    if (!ensureWritableRoot("Animation export")) return;
 
     setAnimationExporting(true);
     setAnimationContextMenu(null);
@@ -1540,7 +1611,7 @@ function App() {
     <div className="text-center text-zinc-400">
       <div className="text-lg font-semibold">Nothing selected</div>
       <div className="mt-2 text-sm">
-        Pick a root folder and choose a file from the list.
+        Pick a folder or ZIP archive and choose a file from the list.
       </div>
     </div>
   );
@@ -1859,21 +1930,31 @@ function App() {
           style={{ width: `${folderWidth}px` }}
         >
           <div className="shrink-0 border-b border-zinc-200 p-3 dark:border-zinc-800">
-            <div className="flex items-center gap-2">
-              <div className="shrink-0 text-[14px] font-semibold">Media Vault</div>
-              <div className="min-w-0 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                {rootFolderName || "No folder"}{rootPath ? ` / ${rootPath}` : ""}
+              <div className="flex items-center gap-2">
+                <div className="shrink-0 text-[14px] font-semibold">Media Vault</div>
+                <div className="min-w-0 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
+                  {rootFolderName || "No folder"}{rootPath ? ` / ${rootPath}` : ""}
+                </div>
               </div>
-            </div>
 
-            <button
-              className="mt-3 w-full rounded-lg bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-zinc-800 disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
-              type="button"
-              onClick={handlePickRootFolder}
-              disabled={isLoading || isSaving}
-            >
-              {isLoading ? "Scanning..." : "Choose Folder"}
-            </button>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button
+                className="w-full rounded-lg bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-zinc-800 disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
+                type="button"
+                onClick={handlePickRootFolder}
+                disabled={isLoading || isSaving}
+              >
+                {isLoading ? "Scanning..." : "Choose Folder"}
+              </button>
+              <button
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-zinc-200 hover:bg-zinc-900 disabled:cursor-wait disabled:opacity-70"
+                type="button"
+                onClick={handlePickZipArchive}
+                disabled={isLoading || isSaving}
+              >
+                {isLoading ? "Scanning..." : "Open ZIP"}
+              </button>
+            </div>
 
           </div>
 

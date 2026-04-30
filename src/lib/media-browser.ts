@@ -95,19 +95,27 @@ export function filterMediaItems(
   },
 ) {
   const normalizedQuery = options.query.trim().toLowerCase();
+  const folderPrefix = options.folderPath ? `${options.folderPath}/` : "";
+  const next: MediaItem[] = [];
 
-  return items
-    .filter((item) =>
-      options.folderPath ? item.relativePath.startsWith(`${options.folderPath}/`) : true,
-    )
-    .filter((item) => (options.kindFilter === "all" ? true : item.kind === options.kindFilter))
-    .filter((item) => {
-      if (!normalizedQuery) return true;
-      return (
-        item.name.toLowerCase().includes(normalizedQuery) ||
-        item.relativePath.toLowerCase().includes(normalizedQuery)
-      );
-    });
+  for (const item of items) {
+    if (folderPrefix && !item.relativePath.startsWith(folderPrefix)) {
+      continue;
+    }
+    if (options.kindFilter !== "all" && item.kind !== options.kindFilter) {
+      continue;
+    }
+    if (
+      normalizedQuery &&
+      !item.name.toLowerCase().includes(normalizedQuery) &&
+      !item.relativePath.toLowerCase().includes(normalizedQuery)
+    ) {
+      continue;
+    }
+    next.push(item);
+  }
+
+  return next;
 }
 
 export function buildFilesByFolder(items: MediaItem[]) {
@@ -125,6 +133,7 @@ export function buildFilesByFolder(items: MediaItem[]) {
 
 export function buildFolderTree(rootFolderName: string, items: MediaItem[]) {
   const nodes = new Map<string, FolderTreeNode>();
+  const childSets = new Map<string, Set<string>>();
 
   nodes.set("", {
     path: "",
@@ -142,13 +151,14 @@ export function buildFolderTree(rootFolderName: string, items: MediaItem[]) {
 
     nodes.get("")!.itemCount += 1;
 
-    for (const segment of segments) {
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
       const nextPath = currentPath ? `${currentPath}/${segment}` : segment;
       if (!nodes.has(nextPath)) {
         nodes.set(nextPath, {
           path: nextPath,
           name: segment,
-          depth: nextPath.split("/").length,
+          depth: index + 1,
           itemCount: 0,
           coverPath: null,
           children: [],
@@ -156,7 +166,12 @@ export function buildFolderTree(rootFolderName: string, items: MediaItem[]) {
       }
 
       const parentNode = nodes.get(currentPath);
-      if (parentNode && !parentNode.children.includes(nextPath)) {
+      const knownChildren = childSets.get(currentPath) ?? new Set<string>();
+      if (!childSets.has(currentPath)) {
+        childSets.set(currentPath, knownChildren);
+      }
+      if (parentNode && !knownChildren.has(nextPath)) {
+        knownChildren.add(nextPath);
         parentNode.children.push(nextPath);
       }
 

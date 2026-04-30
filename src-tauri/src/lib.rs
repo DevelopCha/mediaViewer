@@ -3,17 +3,22 @@ use rfd::FileDialog;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
+use zip::ZipArchive;
 
 const BACKGROUND_TASK_EVENT: &str = "background-task-updated";
 const MAX_BACKGROUND_TASK_HISTORY: usize = 30;
 const LARGE_IMAGE_WARNING_BYTES: u64 = 12 * 1024 * 1024;
+const BUNDLED_VENV_DIR: &str = ".rembg-venv";
+const BUNDLED_SCRIPTS_DIR: &str = "scripts";
+const BUNDLED_TOOLS_DIR: &str = "resources/tools";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -123,12 +128,21 @@ fn now_ms() -> u128 {
 
 fn media_kind_for_extension(ext: &str) -> Option<&'static str> {
     match ext {
-        ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".svg" | ".avif" => {
-            Some("image")
-        }
+        ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".svg" | ".avif" => Some("image"),
         ".mp4" | ".mov" | ".m4v" | ".webm" | ".mkv" | ".avi" | ".wmv" => Some("video"),
         _ => None,
     }
+}
+
+fn extension_from_path(path: &Path) -> String {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{}", value.to_lowercase()))
+        .unwrap_or_default()
+}
+
+fn is_zip_archive(path: &Path) -> bool {
+    extension_from_path(path) == ".zip"
 }
 
 fn modified_ms(metadata: &std::fs::Metadata) -> u128 {
@@ -149,6 +163,77 @@ fn silent_command(program: &str) -> Command {
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn bundled_resource_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path().resource_dir().ok()
+}
+
+fn bundled_resource_path(app: &AppHandle, relative: impl AsRef<Path>) -> Option<PathBuf> {
+    let candidate = bundled_resource_dir(app)?.join(relative);
+    candidate.exists().then_some(candidate)
+}
+
+fn runtime_base_dir(app: &AppHandle) -> PathBuf {
+    bundled_resource_dir(app).unwrap_or_else(manifest_dir)
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn platform_tools_dir() -> &'static str {
+    "windows-x86_64"
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+fn platform_tools_dir() -> &'static str {
+    "windows-aarch64"
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn platform_tools_dir() -> &'static str {
+    "macos-aarch64"
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn platform_tools_dir() -> &'static str {
+    "macos-x86_64"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn platform_tools_dir() -> &'static str {
+    "linux-x86_64"
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn platform_tools_dir() -> &'static str {
+    "linux-aarch64"
+}
+
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64")
+)))]
+fn platform_tools_dir() -> &'static str {
+    "unsupported-platform"
+}
+
+fn tool_file_name(base: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return format!("{base}.exe");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        base.to_string()
+    }
 }
 
 fn detect_python_launcher() -> Result<(String, Vec<String>), String> {
@@ -175,14 +260,14 @@ fn detect_python_launcher() -> Result<(String, Vec<String>), String> {
 }
 
 fn rembg_venv_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".rembg-venv")
+    manifest_dir().join(BUNDLED_VENV_DIR)
 }
 
-fn rembg_python_path() -> PathBuf {
+fn rembg_python_path_from_dir(venv_dir: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
-        rembg_venv_dir().join("Scripts").join("python.exe")
+        venv_dir.join("Scripts").join("python.exe")
     } else {
-        rembg_venv_dir().join("bin").join("python3")
+        venv_dir.join("bin").join("python3")
     }
 }
 
@@ -215,22 +300,61 @@ fn run_command_without_capture(
     args: &[String],
     working_dir: &Path,
 ) -> Result<(), String> {
-    let status = silent_command(program)
+    let output = silent_command(program)
         .args(args)
         .current_dir(working_dir)
-        .status()
+        .output()
         .map_err(|error| error.to_string())?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Command failed with status {status}."))
+    if output.status.success() {
+        return Ok(());
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let details = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("Command failed with status {}.", output.status)
+    };
+
+    Err(details)
 }
 
-fn ensure_rembg_python() -> Result<PathBuf, String> {
-    let venv_python = rembg_python_path();
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+fn ensure_bundled_rembg_python(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    let Some(venv_dir) = bundled_resource_path(app, BUNDLED_VENV_DIR) else {
+        return Ok(None);
+    };
+    let venv_python = rembg_python_path_from_dir(&venv_dir);
+    if !venv_python.exists() {
+        return Err(
+            "The bundled background-removal runtime is missing Python. Rebuild the installer with the packaged runtime."
+                .to_string(),
+        );
+    }
+
+    let check_args = vec![
+        "-c".to_string(),
+        "import rembg, onnxruntime, withoutbg, PIL".to_string(),
+    ];
+
+    run_command(&venv_python.to_string_lossy(), &check_args, &venv_dir).map_err(|error| {
+        format!("The bundled background-removal runtime is incomplete. {error}")
+    })?;
+
+    Ok(Some(venv_python))
+}
+
+fn ensure_rembg_python(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(venv_python) = ensure_bundled_rembg_python(app)? {
+        return Ok(venv_python);
+    }
+
+    let venv_dir = rembg_venv_dir();
+    let venv_python = rembg_python_path_from_dir(&venv_dir);
+    let manifest_dir = manifest_dir();
 
     if !venv_python.exists() {
         let (launcher, launcher_args) = detect_python_launcher()?;
@@ -238,7 +362,7 @@ fn ensure_rembg_python() -> Result<PathBuf, String> {
         args.extend([
             "-m".to_string(),
             "venv".to_string(),
-            rembg_venv_dir().to_string_lossy().to_string(),
+            venv_dir.to_string_lossy().to_string(),
         ]);
         run_command(&launcher, &args, &manifest_dir).map_err(|error| {
             format!("Failed to create the background-removal environment. {error}")
@@ -269,6 +393,24 @@ fn ensure_rembg_python() -> Result<PathBuf, String> {
     }
 
     Ok(venv_python)
+}
+
+fn remove_background_script_path(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(script_path) = bundled_resource_path(
+        app,
+        Path::new(BUNDLED_SCRIPTS_DIR).join("remove_background.py"),
+    ) {
+        return Ok(script_path);
+    }
+
+    let script_path = manifest_dir()
+        .join(BUNDLED_SCRIPTS_DIR)
+        .join("remove_background.py");
+    if script_path.exists() {
+        Ok(script_path)
+    } else {
+        Err("The background-removal script could not be found in the app bundle.".to_string())
+    }
 }
 
 fn is_remove_bg_supported_image(path: &Path) -> bool {
@@ -413,6 +555,70 @@ fn large_media_warning(source: &Path) -> Option<String> {
     Some("Large file detected. This may take longer and use more memory.".to_string())
 }
 
+fn archive_cache_dir(source: &Path) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(source).map_err(|error| error.to_string())?;
+    let modified = modified_ms(&metadata);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalize_path(source).hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    let cache_key = format!("{:016x}", hasher.finish());
+    Ok(std::env::temp_dir()
+        .join("media-vault-archive-cache")
+        .join(cache_key))
+}
+
+fn extract_zip_media_to_cache(source: &Path, target_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
+
+    let file = fs::File::open(source).map_err(|error| error.to_string())?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| format!("Failed to open ZIP archive. {error}"))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("Failed to read ZIP entry. {error}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let Some(relative_path) = entry.enclosed_name() else {
+            continue;
+        };
+        let extension = extension_from_path(&relative_path);
+        if media_kind_for_extension(&extension).is_none() {
+            continue;
+        }
+
+        let output_path = target_dir.join(&relative_path);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+
+        let mut output_file = fs::File::create(&output_path).map_err(|error| error.to_string())?;
+        std::io::copy(&mut entry, &mut output_file).map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn scan_zip_archive(source: &Path) -> Result<ScanResult, String> {
+    let cache_dir = archive_cache_dir(source)?;
+    if !cache_dir.exists() {
+        extract_zip_media_to_cache(source, &cache_dir)?;
+    }
+
+    let mut result = scan_folder(&cache_dir)?;
+    result.root_path = source.to_string_lossy().to_string();
+    result.root_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Archive".to_string());
+    Ok(result)
+}
+
 fn scan_folder(root: &Path) -> Result<ScanResult, String> {
     let mut items = Vec::new();
 
@@ -444,7 +650,12 @@ fn scan_folder(root: &Path) -> Result<ScanResult, String> {
         let relative_path = path
             .strip_prefix(root)
             .map(normalize_path)
-            .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+            .unwrap_or_else(|_| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         let name = path
             .file_stem()
@@ -573,6 +784,7 @@ fn enqueue_background_task(
 }
 
 fn perform_background_removal_with_engine(
+    app: &AppHandle,
     source_path: &str,
     output_path: &str,
     engine_key: &str,
@@ -592,10 +804,9 @@ fn perform_background_removal_with_engine(
     fs::copy(&source, &copied_source)
         .map_err(|error| format!("Failed to copy the original file. {error}"))?;
 
-    let python = ensure_rembg_python()?;
-    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("remove_background.py");
+    let python = ensure_rembg_python(app)?;
+    let script_path = remove_background_script_path(app)?;
+    let runtime_dir = runtime_base_dir(app);
 
     let args = vec![
         script_path.to_string_lossy().to_string(),
@@ -604,11 +815,7 @@ fn perform_background_removal_with_engine(
         engine_key.to_string(),
     ];
 
-    let result = run_command(
-        &python.to_string_lossy(),
-        &args,
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-    );
+    let result = run_command(&python.to_string_lossy(), &args, &runtime_dir);
 
     if let Err(error) = result {
         let _ = fs::remove_file(&copied_source);
@@ -622,7 +829,26 @@ fn perform_background_removal_with_engine(
     Ok(())
 }
 
-fn detect_ffmpeg_binary(name: &str) -> Result<String, String> {
+fn detect_ffmpeg_binary(app: &AppHandle, name: &str) -> Result<String, String> {
+    let bundled_name = tool_file_name(name);
+    if let Some(tool_path) = bundled_resource_path(
+        app,
+        Path::new(BUNDLED_TOOLS_DIR)
+            .join(platform_tools_dir())
+            .join(&bundled_name),
+    ) {
+        let output = silent_command(&tool_path.to_string_lossy())
+            .arg("-version")
+            .output()
+            .map_err(|error| format!("Failed to launch the bundled {name}. {error}"))?;
+
+        if output.status.success() {
+            return Ok(tool_path.to_string_lossy().to_string());
+        }
+
+        return Err(format!("The bundled {name} is not executable."));
+    }
+
     let output = silent_command(name)
         .arg("-version")
         .output()
@@ -631,12 +857,14 @@ fn detect_ffmpeg_binary(name: &str) -> Result<String, String> {
     if output.status.success() {
         Ok(name.to_string())
     } else {
-        Err(format!("{name} is not available. Install FFmpeg to extract video frames."))
+        Err(format!(
+            "{name} is not available. Install FFmpeg to extract video frames."
+        ))
     }
 }
 
-fn video_duration_seconds(source: &Path) -> Result<f64, String> {
-    let ffprobe = detect_ffmpeg_binary("ffprobe")?;
+fn video_duration_seconds(app: &AppHandle, source: &Path) -> Result<f64, String> {
+    let ffprobe = detect_ffmpeg_binary(app, "ffprobe")?;
     let args = vec![
         "-v".to_string(),
         "error".to_string(),
@@ -677,10 +905,34 @@ fn frame_extraction_filter(preset_key: &str, duration_seconds: f64) -> Result<St
     Ok(filter)
 }
 
-fn frame_extraction_crop_filter(
-    eye_mode: &str,
-    layout: &str,
-) -> Result<Option<String>, String> {
+fn frame_extraction_output_settings(
+    preset_key: &str,
+) -> Result<(&'static str, Vec<String>), String> {
+    match preset_key {
+        "summary_12" | "summary_24" | "summary_60" => Ok((
+            "png",
+            vec!["-compression_level".to_string(), "2".to_string()],
+        )),
+        // Dense extraction on large videos becomes much more reliable when we avoid
+        // writing thousands of full-resolution PNG files, while still keeping output lossless.
+        "fps_30" | "fps_45" | "fps_60" => Ok((
+            "webp",
+            vec![
+                "-c:v".to_string(),
+                "libwebp".to_string(),
+                "-lossless".to_string(),
+                "1".to_string(),
+                "-compression_level".to_string(),
+                "4".to_string(),
+                "-quality".to_string(),
+                "100".to_string(),
+            ],
+        )),
+        _ => Err("Unknown frame extraction preset.".to_string()),
+    }
+}
+
+fn frame_extraction_crop_filter(eye_mode: &str, layout: &str) -> Result<Option<String>, String> {
     match eye_mode {
         "standard" => Ok(None),
         "left" => match layout {
@@ -698,6 +950,7 @@ fn frame_extraction_crop_filter(
 }
 
 fn perform_frame_extraction(
+    app: &AppHandle,
     source_path: &str,
     output_dir: &str,
     preset_key: &str,
@@ -706,9 +959,10 @@ fn perform_frame_extraction(
 ) -> Result<(), String> {
     let source = PathBuf::from(source_path);
     let output = PathBuf::from(output_dir);
-    let ffmpeg = detect_ffmpeg_binary("ffmpeg")?;
-    let duration_seconds = video_duration_seconds(&source)?;
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let duration_seconds = video_duration_seconds(app, &source)?;
     let fps_filter = frame_extraction_filter(preset_key, duration_seconds)?;
+    let (output_extension, output_args) = frame_extraction_output_settings(preset_key)?;
     let crop_filter = frame_extraction_crop_filter(eye_mode, layout)?;
     let video_filter = match crop_filter {
         Some(crop) => format!("{crop},{fps_filter}"),
@@ -720,9 +974,9 @@ fn perform_frame_extraction(
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("frame");
-    let output_pattern = output.join(format!("{stem}_%04d.png"));
+    let output_pattern = output.join(format!("{stem}_%04d.{output_extension}"));
 
-    let args = vec![
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
@@ -732,16 +986,16 @@ fn perform_frame_extraction(
         video_filter,
         "-vsync".to_string(),
         "vfr".to_string(),
-        "-q:v".to_string(),
-        "1".to_string(),
-        output_pattern.to_string_lossy().to_string(),
     ];
+    args.extend(output_args);
+    args.push(output_pattern.to_string_lossy().to_string());
 
     run_command_without_capture(&ffmpeg, &args, &output)
         .map_err(|error| format!("Frame extraction failed. {error}"))
 }
 
 fn export_animation_from_images(
+    app: &AppHandle,
     image_paths: &[String],
     format: &str,
     fps: u32,
@@ -754,10 +1008,15 @@ fn export_animation_from_images(
         return Err("Unsupported animation format.".to_string());
     }
 
-    let ffmpeg = detect_ffmpeg_binary("ffmpeg")?;
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
     let paths: Vec<PathBuf> = image_paths.iter().map(PathBuf::from).collect();
     let parent_dir = common_parent_dir(&paths)
-        .or_else(|| paths.first().and_then(|path| path.parent()).map(Path::to_path_buf))
+        .or_else(|| {
+            paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(Path::to_path_buf)
+        })
         .ok_or_else(|| "Could not resolve the output folder.".to_string())?;
     let base_name = parent_dir
         .file_name()
@@ -803,9 +1062,7 @@ fn export_animation_from_images(
         if format == "gif" {
             args.extend([
                 "-filter_complex".to_string(),
-                format!(
-                    "fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-                ),
+                format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"),
                 "-loop".to_string(),
                 "0".to_string(),
                 output_path.to_string_lossy().to_string(),
@@ -844,7 +1101,11 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
                     if let Some(task) = state.tasks.get_mut(&task_id) {
                         task.status = "running".to_string();
                         task.progress = 12;
-                        task.message = "Preparing background removal...".to_string();
+                        task.message = if task.kind == "extractFrames" {
+                            "Preparing frame extraction...".to_string()
+                        } else {
+                            "Preparing background removal...".to_string()
+                        };
                         task.updated_at_ms = now_ms();
                         Some(task.clone())
                     } else {
@@ -867,7 +1128,11 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
                 &task.id,
                 "running",
                 30,
-                "Preparing model and runtime...",
+                if task.kind == "extractFrames" {
+                    "Preparing video decoder..."
+                } else {
+                    "Preparing model and runtime..."
+                },
                 None,
             );
             update_task(
@@ -876,7 +1141,11 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
                 &task.id,
                 "running",
                 68,
-                "Removing background. Large images can take a while...",
+                if task.kind == "extractFrames" {
+                    "Extracting frames. Large videos can take a while..."
+                } else {
+                    "Removing background. Large images can take a while..."
+                },
                 None,
             );
 
@@ -892,15 +1161,22 @@ fn spawn_background_worker(app: AppHandle, tasks: Arc<Mutex<BackgroundRemovalQue
                 .clone()
                 .unwrap_or_else(|| "sbs".to_string());
             let task_kind = task.kind.clone();
+            let worker_app = app.clone();
             let result = tauri::async_runtime::spawn_blocking(move || match task_kind.as_str() {
                 "extractFrames" => perform_frame_extraction(
+                    &worker_app,
                     &source_path,
                     &output_path,
                     &engine_key,
                     &extract_eye_mode,
                     &extract_layout,
                 ),
-                _ => perform_background_removal_with_engine(&source_path, &output_path, &engine_key),
+                _ => perform_background_removal_with_engine(
+                    &worker_app,
+                    &source_path,
+                    &output_path,
+                    &engine_key,
+                ),
             })
             .await
             .map_err(|error| error.to_string())
@@ -952,15 +1228,26 @@ fn pick_root_folder() -> Option<String> {
 }
 
 #[tauri::command]
+fn pick_root_archive() -> Option<String> {
+    FileDialog::new()
+        .add_filter("ZIP archive", &["zip"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn scan_media_folder(root_path: String) -> Result<ScanResult, String> {
     let root = PathBuf::from(root_path);
     if !root.exists() {
         return Err("Selected folder no longer exists.".to_string());
     }
-    if !root.is_dir() {
-        return Err("Selected path is not a folder.".to_string());
+    if root.is_dir() {
+        return scan_folder(&root);
     }
-    scan_folder(&root)
+    if is_zip_archive(&root) {
+        return scan_zip_archive(&root);
+    }
+    Err("Selected path must be a folder or ZIP archive.".to_string())
 }
 
 #[tauri::command]
@@ -1043,7 +1330,10 @@ fn create_media_folder(root_path: String, relative_folder_path: String) -> Resul
 }
 
 #[tauri::command]
-fn duplicate_media_folder(root_path: String, relative_folder_path: String) -> Result<String, String> {
+fn duplicate_media_folder(
+    root_path: String,
+    relative_folder_path: String,
+) -> Result<String, String> {
     if relative_folder_path.is_empty() {
         return Err("The root folder cannot be duplicated.".to_string());
     }
@@ -1150,8 +1440,8 @@ fn enqueue_extract_video_frames(
         return Err("Frame extraction is only available for videos.".to_string());
     }
 
-    detect_ffmpeg_binary("ffmpeg")?;
-    detect_ffmpeg_binary("ffprobe")?;
+    detect_ffmpeg_binary(&app, "ffmpeg")?;
+    detect_ffmpeg_binary(&app, "ffprobe")?;
 
     let output_dir = extract_frames_output_dir(&source)?;
     let extract_eye_mode = eye_mode.unwrap_or_else(|| "standard".to_string());
@@ -1231,11 +1521,12 @@ fn enqueue_extract_video_frames(
 
 #[tauri::command]
 fn export_image_sequence_animation(
+    app: AppHandle,
     image_paths: Vec<String>,
     format: String,
     fps: u32,
 ) -> Result<String, String> {
-    export_animation_from_images(&image_paths, &format, fps)
+    export_animation_from_images(&app, &image_paths, &format, fps)
 }
 
 #[tauri::command]
@@ -1300,6 +1591,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             pick_root_folder,
+            pick_root_archive,
             scan_media_folder,
             rename_media_file,
             delete_media_file,
