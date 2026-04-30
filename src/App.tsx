@@ -1,9 +1,5 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import {
-  memo,
   startTransition,
-  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type SyntheticEvent,
   type WheelEvent as ReactWheelEvent,
@@ -14,6 +10,8 @@ import {
   useRef,
   useState,
 } from "react";
+import { FolderTreeBranch, MediaListRow } from "./components/media-browser-parts";
+import { clamp, clampMenuPosition, classNames, formatBytes, formatDate } from "./lib/format";
 import {
   buildFilesByFolder,
   buildFolderTree,
@@ -24,35 +22,50 @@ import {
   parentFolderPath,
   sortMediaItems,
   type ExplorerSelection,
-  type FolderTreeNode,
   type MediaItem,
   type MediaKind,
-  type ScanResult,
   type SortKey,
   type TreeVisibleEntry,
 } from "./lib/media-browser";
+import {
+  BACKGROUND_ENGINES,
+  FRAME_EXTRACT_PRESETS,
+  backgroundTaskLabel,
+  backgroundTaskProgressLabel,
+  resolveVideoVrLayout,
+  type AnimationExportFormat,
+  type BackgroundEngineKey,
+  type BackgroundTask,
+  type ContextMenuState,
+  type ContextSubmenu,
+  type FrameExtractPresetKey,
+  type VideoEyeMode,
+  type VideoVrLayout,
+  type VideoVrLayoutSetting,
+  upsertBackgroundTask,
+  videoVrTransformStyle,
+} from "./lib/media-processing";
+import {
+  assetUrl,
+  cancelBackgroundTask as cancelBackgroundTaskCommand,
+  clearFinishedBackgroundTasks as clearFinishedBackgroundTasksCommand,
+  createMediaFolder,
+  deleteMediaFile,
+  deleteMediaFolder,
+  duplicateMediaFile,
+  duplicateMediaFolder,
+  enqueueExtractVideoFrames,
+  enqueueRemoveImageBackground,
+  exportImageSequenceAnimation,
+  listBackgroundTasks,
+  onBackgroundTaskUpdate,
+  pickRootArchive,
+  pickRootFolder,
+  renameMediaFile,
+  scanMediaFolder,
+} from "./lib/tauri-media";
 
 type PaneKey = "folders" | "preview";
-type BackgroundTaskStatus = "queued" | "running" | "completed" | "failed";
-
-type BackgroundTask = {
-  id: string;
-  kind: string;
-  engineKey: string;
-  engineLabel: string;
-  extractEyeMode?: VideoEyeMode | null;
-  extractLayout?: VideoVrLayout | null;
-  sourcePath: string;
-  outputPath: string;
-  fileName: string;
-  status: BackgroundTaskStatus;
-  progress: number;
-  message: string;
-  createdAtMs: number;
-  updatedAtMs: number;
-  error: string | null;
-  warning?: string | null;
-};
 
 const IMAGE_ZOOM_MIN = 0.5;
 const IMAGE_ZOOM_MAX = 6;
@@ -65,29 +78,6 @@ const MAX_FOLDER_WIDTH = 460;
 const CONTEXT_MENU_WIDTH = 176;
 const CONTEXT_SUBMENU_WIDTH = 224;
 const MENU_VIEWPORT_MARGIN = 12;
-
-function formatBytes(bytes: number) {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let index = 0;
-  while (value >= 1024 && index < units.length - 1) {
-    value /= 1024;
-    index += 1;
-  }
-  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
-}
-
-function formatDate(ms: number) {
-  return new Date(ms).toLocaleString();
-}
-
-function classNames(...xs: Array<string | false | null | undefined>) {
-  return xs.filter(Boolean).join(" ");
-}
-
-function assetUrl(path: string) {
-  return convertFileSrc(path);
-}
 
 function buildItemMaps(items: MediaItem[]) {
   const byId = new Map<string, MediaItem>();
@@ -102,440 +92,6 @@ function buildItemMaps(items: MediaItem[]) {
 function isArchiveRootPath(path: string) {
   return path.trim().toLowerCase().endsWith(".zip");
 }
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
-
-function clampMenuPosition(x: number, y: number, width: number, height: number) {
-  if (typeof window === "undefined") {
-    return { x, y };
-  }
-
-  const maxX = Math.max(MENU_VIEWPORT_MARGIN, window.innerWidth - width - MENU_VIEWPORT_MARGIN);
-  const maxY = Math.max(MENU_VIEWPORT_MARGIN, window.innerHeight - height - MENU_VIEWPORT_MARGIN);
-
-  return {
-    x: clamp(x, MENU_VIEWPORT_MARGIN, maxX),
-    y: clamp(y, MENU_VIEWPORT_MARGIN, maxY),
-  };
-}
-
-function resolveVideoVrLayout(
-  setting: VideoVrLayoutSetting,
-  dimensions: { width: number; height: number } | null,
-): VideoVrLayout {
-  if (setting !== "auto") {
-    return setting;
-  }
-
-  if (dimensions && dimensions.height > dimensions.width) {
-    return "ou";
-  }
-
-  return "sbs";
-}
-
-function videoVrTransformStyle(
-  mode: VideoEyeMode,
-  layout: VideoVrLayout,
-): CSSProperties | undefined {
-  if (mode === "standard") {
-    return undefined;
-  }
-
-  if (layout === "ou") {
-    if (mode === "right") {
-      return {
-        transform: "translateY(-100%) scaleY(2)",
-        transformOrigin: "center top",
-      };
-    }
-
-    return {
-      transform: "scaleY(2)",
-      transformOrigin: "center top",
-    };
-  }
-
-  if (mode === "right") {
-    return {
-      transform: "translateX(-100%) scaleX(2)",
-      transformOrigin: "left center",
-    };
-  }
-
-  return {
-    transform: "scaleX(2)",
-    transformOrigin: "left center",
-  };
-}
-
-function upsertBackgroundTask(tasks: BackgroundTask[], task: BackgroundTask) {
-  const existingIndex = tasks.findIndex((candidate) => candidate.id === task.id);
-  if (existingIndex < 0) {
-    return [task, ...tasks];
-  }
-
-  const next = [...tasks];
-  next[existingIndex] = task;
-  return next.sort((a, b) => b.createdAtMs - a.createdAtMs);
-}
-
-function backgroundTaskLabel(status: BackgroundTaskStatus) {
-  switch (status) {
-    case "queued":
-      return "Queued";
-    case "running":
-      return "Running";
-    case "completed":
-      return "Completed";
-    case "failed":
-      return "Failed";
-    default:
-      return status;
-  }
-}
-
-function backgroundTaskProgressLabel(task: BackgroundTask) {
-  if (task.status === "queued") {
-    return "Waiting";
-  }
-  if (task.status === "running") {
-    return "In progress";
-  }
-  if (task.status === "failed") {
-    return "Failed";
-  }
-  return `${task.progress}%`;
-}
-
-type BackgroundEngineKey = "anime" | "real" | "bria" | "withoutbg";
-type FrameExtractPresetKey =
-  | "summary_12"
-  | "summary_24"
-  | "summary_60"
-  | "fps_30"
-  | "fps_45"
-  | "fps_60";
-type AnimationExportFormat = "gif" | "webp";
-type ContextSubmenu = "background-remove" | "extract-frames" | null;
-type VideoVrLayout = "sbs" | "ou";
-type VideoVrLayoutSetting = "auto" | VideoVrLayout;
-type VideoEyeMode = "standard" | "left" | "right";
-type ContextMenuState =
-  | { x: number; y: number; target: "item"; itemId: string }
-  | { x: number; y: number; target: "folder"; folderPath: string };
-
-const BACKGROUND_ENGINES: Array<{
-  key: BackgroundEngineKey;
-  label: string;
-}> = [
-  { key: "anime", label: "ISNet Anime (Anime)" },
-  { key: "real", label: "ISNet General (Real)" },
-  { key: "bria", label: "BRIA RMBG (Real)" },
-  { key: "withoutbg", label: "withoutBG (HQ)" },
-];
-
-const FRAME_EXTRACT_PRESETS: Array<{
-  key: FrameExtractPresetKey;
-  label: string;
-}> = [
-  { key: "summary_12", label: "Summary 12 Frames" },
-  { key: "summary_24", label: "Summary 24 Frames" },
-  { key: "summary_60", label: "Summary 60 Frames" },
-  { key: "fps_30", label: "Animation Extract 30 FPS" },
-  { key: "fps_45", label: "Animation Extract 45 FPS" },
-  { key: "fps_60", label: "Animation Extract 60 FPS" },
-];
-
-const VideoThumb = memo(function VideoThumb({
-  path,
-  active,
-}: {
-  path: string;
-  active: boolean;
-}) {
-  const [hovered, setHovered] = useState(false);
-  const ref = useRef<HTMLVideoElement | null>(null);
-  const shouldPlay = active || hovered;
-  const src = assetUrl(path);
-
-  useEffect(() => {
-    const node = ref.current;
-    if (!node) return;
-
-    if (shouldPlay) {
-      const promise = node.play();
-      if (promise) {
-        promise.catch(() => {});
-      }
-      return;
-    }
-
-    node.pause();
-    if (node.readyState >= 1) {
-      try {
-        node.currentTime = Math.min(0.05, node.duration || 0.05);
-      } catch {
-        // Ignore browsers that don't allow seeking this early.
-      }
-    }
-  }, [shouldPlay, src]);
-
-  return (
-    <video
-      ref={ref}
-      src={src}
-      className="h-full w-full object-cover"
-      muted
-      loop
-      playsInline
-      preload="metadata"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onLoadedMetadata={(event) => {
-        if (shouldPlay) return;
-        const node = event.currentTarget;
-        try {
-          node.currentTime = Math.min(0.05, node.duration || 0.05);
-        } catch {
-          // Ignore early seek failures.
-        }
-      }}
-    />
-  );
-});
-
-const MediaListRow = memo(function MediaListRow({
-  item,
-  isActive,
-  isSelected,
-  itemHeight,
-  onSelect,
-  onContextMenu,
-}: {
-  item: MediaItem;
-  isActive: boolean;
-  isSelected: boolean;
-  itemHeight: number;
-  onSelect: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-  onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={(event) => onSelect(event, item)}
-      onContextMenu={(event) => onContextMenu(event, item)}
-      className={classNames(
-        "flex w-full items-center gap-2 rounded-xl border px-2 py-1 text-left transition",
-        isActive
-          ? "border-zinc-950 bg-zinc-950 text-white dark:border-white dark:bg-white dark:text-zinc-950"
-          : isSelected
-            ? "border-sky-700 bg-sky-50 text-zinc-950 dark:border-sky-500 dark:bg-sky-950/40 dark:text-zinc-50"
-          : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
-      )}
-      style={{ height: `${itemHeight - 4}px` }}
-    >
-      <div className="h-10 w-14 shrink-0 overflow-hidden rounded-lg bg-zinc-200 dark:bg-zinc-800">
-        {item.kind === "image" ? (
-          <img
-            src={assetUrl(item.path)}
-            alt={item.name}
-            className="h-full w-full object-cover"
-            loading="lazy"
-          />
-        ) : (
-          <VideoThumb path={item.path} active={isActive} />
-        )}
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-[12px] font-semibold leading-5">
-          {item.name}
-          <span
-            className={classNames(
-              "ml-1 text-[10px] font-normal",
-              isActive ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
-            )}
-          >
-            {item.ext}
-          </span>
-        </div>
-        <div
-          className={classNames(
-            "truncate text-[10px]",
-            isActive ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
-          )}
-        >
-          {item.relativePath} / {formatBytes(item.sizeBytes)}
-        </div>
-      </div>
-    </button>
-  );
-});
-
-const FolderTreeBranch = memo(function FolderTreeBranch({
-  nodePath,
-  nodes,
-  selectedPath,
-  rootLabel,
-  expandedPaths,
-  folderFiles,
-  activeFileId,
-  selectedItemIds,
-  onSelect,
-  onToggle,
-  onSelectFile,
-  onContextMenuFolder,
-  onContextMenuFile,
-}: {
-  nodePath: string;
-  nodes: Map<string, FolderTreeNode>;
-  selectedPath: string;
-  rootLabel: string;
-  expandedPaths: Set<string>;
-  folderFiles: Map<string, MediaItem[]>;
-  activeFileId: string | null;
-  selectedItemIds: Set<string>;
-  onSelect: (path: string) => void;
-  onToggle: (path: string) => void;
-  onSelectFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-  onContextMenuFolder: (event: ReactMouseEvent<HTMLButtonElement>, path: string) => void;
-  onContextMenuFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-}) {
-  const node = nodes.get(nodePath);
-  if (!node) return null;
-
-  const label = node.path ? node.name : rootLabel || "Root";
-  const isSelected = selectedPath === node.path;
-  const files = folderFiles.get(node.path) ?? [];
-  const isExpanded = expandedPaths.has(node.path);
-  const canExpand = node.children.length > 0 || files.length > 0;
-
-  return (
-    <div>
-      <div
-        className={classNames(
-          "flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left transition",
-          isSelected
-            ? "bg-zinc-950 text-white dark:bg-white dark:text-zinc-950"
-            : "hover:bg-zinc-100 dark:hover:bg-zinc-900",
-        )}
-        data-tree-key={`folder:${node.path}`}
-        style={{ paddingLeft: `${10 + node.depth * 12}px` }}
-      >
-        <button
-          type="button"
-          onClick={() => onSelect(node.path)}
-          onContextMenu={(event) => onContextMenuFolder(event, node.path)}
-          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-        >
-          <div className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md bg-zinc-200 text-[8px] font-semibold text-zinc-500 dark:bg-zinc-800 dark:text-zinc-300">
-            {node.coverPath ? (
-              <img
-                src={assetUrl(node.coverPath)}
-                alt={label}
-                className="h-full w-full object-cover"
-                loading="lazy"
-              />
-            ) : (
-              "DIR"
-            )}
-          </div>
-          <div className="min-w-0 flex-1 truncate text-[11px] font-medium leading-5">
-            {label}
-          </div>
-          <div
-            className={classNames(
-              "shrink-0 text-[9px]",
-              isSelected ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
-            )}
-          >
-            {node.itemCount}
-          </div>
-        </button>
-        <button
-          type="button"
-          aria-label={isExpanded ? "Collapse folder" : "Expand folder"}
-          onClick={() => {
-            if (canExpand) onToggle(node.path);
-          }}
-          className={classNames(
-            "flex h-5 w-5 shrink-0 items-center justify-center rounded border text-[10px] font-semibold transition",
-            canExpand
-              ? "border-zinc-700 text-zinc-400 hover:bg-zinc-900 dark:border-zinc-300 dark:text-zinc-600 dark:hover:bg-zinc-200"
-              : "border-transparent text-transparent",
-          )}
-        >
-          {canExpand ? (isExpanded ? "-" : "+") : "+"}
-        </button>
-      </div>
-
-      {isExpanded ? (
-        <>
-          {files.map((file) => (
-            <button
-              key={file.id}
-              type="button"
-              onClick={(event) => onSelectFile(event, file)}
-              onContextMenu={(event) => onContextMenuFile(event, file)}
-              className={classNames(
-                "flex w-full items-center gap-2 rounded-lg px-2 py-0.5 text-left transition",
-                activeFileId === file.id
-                  ? "bg-zinc-900/90 text-white dark:bg-zinc-100 dark:text-zinc-950"
-                  : selectedItemIds.has(file.id)
-                    ? "bg-zinc-200 text-zinc-950 dark:bg-zinc-800 dark:text-zinc-50"
-                  : "hover:bg-zinc-100 dark:hover:bg-zinc-900",
-              )}
-              data-tree-key={`file:${file.id}`}
-              style={{ paddingLeft: `${28 + node.depth * 12}px` }}
-            >
-              <div className="flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded border border-zinc-800 bg-zinc-950 text-[8px] font-semibold text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
-                {file.kind === "image" ? (
-                  <img
-                    src={assetUrl(file.path)}
-                    alt={file.name}
-                    className="h-full w-full object-cover"
-                    loading="lazy"
-                  />
-                ) : file.kind === "video" ? (
-                  "VID"
-                ) : (
-                  "FIL"
-                )}
-              </div>
-              <div className="min-w-0 flex-1 truncate text-[10px]">
-                {file.name}
-                <span className="ml-1 text-[9px] text-zinc-500 dark:text-zinc-400">
-                  {file.ext}
-                </span>
-              </div>
-            </button>
-          ))}
-
-          {node.children.map((childPath) => (
-            <FolderTreeBranch
-              key={childPath}
-              nodePath={childPath}
-              nodes={nodes}
-              selectedPath={selectedPath}
-              rootLabel={rootLabel}
-              expandedPaths={expandedPaths}
-              folderFiles={folderFiles}
-              activeFileId={activeFileId}
-              selectedItemIds={selectedItemIds}
-              onSelect={onSelect}
-              onToggle={onToggle}
-              onSelectFile={onSelectFile}
-              onContextMenuFolder={onContextMenuFolder}
-              onContextMenuFile={onContextMenuFile}
-            />
-          ))}
-        </>
-      ) : null}
-    </div>
-  );
-});
 
 function App() {
   const [kindFilter, setKindFilter] = useState<"all" | MediaKind>("all");
@@ -742,7 +298,7 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
-    void invoke<BackgroundTask[]>("list_background_tasks")
+    void listBackgroundTasks()
       .then((tasks) => {
         if (!cancelled) {
           setBackgroundTasks(tasks);
@@ -750,8 +306,7 @@ function App() {
       })
       .catch(() => {});
 
-    const unlistenPromise = listen<BackgroundTask>("background-task-updated", (event) => {
-      const task = event.payload;
+    const unlistenPromise = onBackgroundTaskUpdate((task) => {
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
       void syncBackgroundTaskEffect(task);
     });
@@ -775,9 +330,7 @@ function App() {
     setErrorMessage("");
 
     try {
-      const result = await invoke<ScanResult>("scan_media_folder", {
-        rootPath: root,
-      });
+      const result = await scanMediaFolder(root);
       startTransition(() => {
         setItems(result.items);
         setRootFolderName(result.rootName);
@@ -806,7 +359,7 @@ function App() {
   async function handlePickRootFolder() {
     setErrorMessage("");
     try {
-      const selectedRoot = await invoke<string | null>("pick_root_folder");
+      const selectedRoot = await pickRootFolder();
       if (!selectedRoot) return;
       await loadFolder(selectedRoot);
     } catch (error) {
@@ -819,7 +372,7 @@ function App() {
   async function handlePickZipArchive() {
     setErrorMessage("");
     try {
-      const selectedArchive = await invoke<string | null>("pick_root_archive");
+      const selectedArchive = await pickRootArchive();
       if (!selectedArchive) return;
       await loadFolder(selectedArchive);
     } catch (error) {
@@ -846,10 +399,7 @@ function App() {
     setErrorMessage("");
 
     try {
-      const renamedPath = await invoke<string>("rename_media_file", {
-        filePath: active.path,
-        newName: renameValue,
-      });
+      const renamedPath = await renameMediaFile(active.path, renameValue);
       setRenameOpen(false);
       await loadFolder(rootPath, renamedPath);
     } catch (error) {
@@ -871,9 +421,7 @@ function App() {
     setErrorMessage("");
 
     try {
-      await invoke("delete_media_file", {
-        filePath: item.path,
-      });
+      await deleteMediaFile(item.path);
       setInfoOpen(false);
       await loadFolder(rootPath);
     } catch (error) {
@@ -896,9 +444,7 @@ function App() {
 
     try {
       for (const item of selectedItems) {
-        await invoke("delete_media_file", {
-          filePath: item.path,
-        });
+        await deleteMediaFile(item.path);
       }
       setSelectedItemIds(new Set());
       await loadFolder(rootPath);
@@ -930,9 +476,7 @@ function App() {
     setContextMenu(null);
 
     try {
-      const duplicatedPath = await invoke<string>("duplicate_media_file", {
-        filePath: item.path,
-      });
+      const duplicatedPath = await duplicateMediaFile(item.path);
       await loadFolder(rootPath, duplicatedPath);
     } catch (error) {
       setErrorMessage(
@@ -948,10 +492,7 @@ function App() {
     setContextMenu(null);
 
     try {
-      const createdFolderPath = await invoke<string>("create_media_folder", {
-        rootPath,
-        relativeFolderPath,
-      });
+      const createdFolderPath = await createMediaFolder(rootPath, relativeFolderPath);
       const result = await loadFolder(rootPath, null, { preserveSelection: true });
       const nextFolderPath = relativeFolderPathFromAbsolute(createdFolderPath);
       setSelectedFolderPath(nextFolderPath);
@@ -977,10 +518,7 @@ function App() {
     setContextMenu(null);
 
     try {
-      const duplicatedFolderPath = await invoke<string>("duplicate_media_folder", {
-        rootPath,
-        relativeFolderPath,
-      });
+      const duplicatedFolderPath = await duplicateMediaFolder(rootPath, relativeFolderPath);
       const result = await loadFolder(rootPath, null, { preserveSelection: true });
       const nextFolderPath = relativeFolderPathFromAbsolute(duplicatedFolderPath);
       setSelectedFolderPath(nextFolderPath);
@@ -1010,10 +548,7 @@ function App() {
     setContextMenu(null);
 
     try {
-      await invoke("delete_media_folder", {
-        rootPath,
-        relativeFolderPath,
-      });
+      await deleteMediaFolder(rootPath, relativeFolderPath);
       await loadFolder(rootPath);
     } catch (error) {
       setErrorMessage(
@@ -1036,10 +571,7 @@ function App() {
     setContextSubmenu(null);
 
     try {
-      const task = await invoke<BackgroundTask>("enqueue_remove_image_background", {
-        filePath: item.path,
-        engineKey,
-      });
+      const task = await enqueueRemoveImageBackground(item.path, engineKey);
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
     } catch (error) {
       setErrorMessage(
@@ -1064,10 +596,7 @@ function App() {
 
     try {
       for (const item of imageItems) {
-        const task = await invoke<BackgroundTask>("enqueue_remove_image_background", {
-          filePath: item.path,
-          engineKey,
-        });
+        const task = await enqueueRemoveImageBackground(item.path, engineKey);
         setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
       }
     } catch (error) {
@@ -1091,12 +620,12 @@ function App() {
     setContextSubmenu(null);
 
     try {
-      const task = await invoke<BackgroundTask>("enqueue_extract_video_frames", {
-        filePath: item.path,
+      const task = await enqueueExtractVideoFrames(
+        item.path,
         presetKey,
-        eyeMode: videoEyeMode,
-        layout: currentExtractLayout(),
-      });
+        videoEyeMode,
+        currentExtractLayout(),
+      );
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
     } catch (error) {
       setErrorMessage(
@@ -1119,12 +648,12 @@ function App() {
 
     try {
       for (const item of selectedVideoItems) {
-        const task = await invoke<BackgroundTask>("enqueue_extract_video_frames", {
-          filePath: item.path,
+        const task = await enqueueExtractVideoFrames(
+          item.path,
           presetKey,
-          eyeMode: videoEyeMode,
-          layout: currentExtractLayout(),
-        });
+          videoEyeMode,
+          currentExtractLayout(),
+        );
         setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
       }
     } catch (error) {
@@ -1136,7 +665,7 @@ function App() {
 
   async function cancelBackgroundTask(taskId: string) {
     try {
-      const task = await invoke<BackgroundTask>("cancel_background_task", { taskId });
+      const task = await cancelBackgroundTaskCommand(taskId);
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
     } catch (error) {
       setErrorMessage(
@@ -1149,16 +678,16 @@ function App() {
     try {
       const nextTask =
         task.kind === "extractFrames"
-          ? await invoke<BackgroundTask>("enqueue_extract_video_frames", {
-              filePath: task.sourcePath,
-              presetKey: task.engineKey,
-              eyeMode: task.extractEyeMode ?? "standard",
-              layout: task.extractLayout ?? "sbs",
-            })
-          : await invoke<BackgroundTask>("enqueue_remove_image_background", {
-              filePath: task.sourcePath,
-              engineKey: task.engineKey,
-            });
+          ? await enqueueExtractVideoFrames(
+              task.sourcePath,
+              task.engineKey as FrameExtractPresetKey,
+              task.extractEyeMode ?? "standard",
+              task.extractLayout ?? "sbs",
+            )
+          : await enqueueRemoveImageBackground(
+              task.sourcePath,
+              task.engineKey as BackgroundEngineKey,
+            );
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, nextTask));
     } catch (error) {
       setErrorMessage(
@@ -1169,8 +698,8 @@ function App() {
 
   async function clearFinishedBackgroundTasks() {
     try {
-      await invoke("clear_finished_background_tasks");
-      const tasks = await invoke<BackgroundTask[]>("list_background_tasks");
+      await clearFinishedBackgroundTasksCommand();
+      const tasks = await listBackgroundTasks();
       setBackgroundTasks(tasks);
     } catch (error) {
       setErrorMessage(
@@ -1438,11 +967,11 @@ function App() {
     setErrorMessage("");
 
     try {
-      const outputPath = await invoke<string>("export_image_sequence_animation", {
-        imagePaths: animationPreviewItems.map((item) => item.path),
+      const outputPath = await exportImageSequenceAnimation(
+        animationPreviewItems.map((item) => item.path),
         format,
-        fps: animationPreviewFps,
-      });
+        animationPreviewFps,
+      );
       if (rootPath) {
         await loadFolder(rootPath, outputPath, { preserveSelection: true });
       }
