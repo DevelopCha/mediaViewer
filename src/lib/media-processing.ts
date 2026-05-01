@@ -9,8 +9,11 @@ export type FrameExtractPresetKey =
   | "fps_30"
   | "fps_45"
   | "fps_60";
-export type AnimationExportFormat = "gif" | "webp";
-export type ContextSubmenu = "background-remove" | "extract-frames" | null;
+export type AnimationExportFormat = "gif" | "webp" | "apng";
+export type ContextSubmenu =
+  | "background-remove"
+  | "extract-frames"
+  | null;
 export type VideoVrLayout = "sbs" | "ou";
 export type VideoVrLayoutSetting = "auto" | VideoVrLayout;
 export type VideoEyeMode = "standard" | "left" | "right";
@@ -23,6 +26,8 @@ export type BackgroundTask = {
   kind: string;
   engineKey: string;
   engineLabel: string;
+  inputPaths?: string[] | null;
+  durationSeconds?: number | null;
   extractEyeMode?: VideoEyeMode | null;
   extractLayout?: VideoVrLayout | null;
   sourcePath: string;
@@ -140,7 +145,7 @@ export function backgroundTaskProgressLabel(task: BackgroundTask) {
     return "Waiting";
   }
   if (task.status === "running") {
-    return "In progress";
+    return `${Math.max(1, task.progress)}%`;
   }
   if (task.status === "failed") {
     return "Failed";

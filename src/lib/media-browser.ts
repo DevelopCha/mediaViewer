@@ -1,4 +1,4 @@
-export type MediaKind = "image" | "video";
+export type MediaKind = "image" | "video" | "zip";
 export type SortKey = "name" | "date" | "size";
 
 export type TreeVisibleEntry =
@@ -35,6 +35,8 @@ export type MediaItem = {
   kind: MediaKind;
   name: string;
   path: string;
+  archivePath?: string | null;
+  archiveEntryPath?: string | null;
   relativePath: string;
   ext: string;
   sizeBytes: number;
@@ -92,25 +94,43 @@ export function filterMediaItems(
     folderPath?: string;
     kindFilter: "all" | MediaKind;
     query: string;
+    includeArchiveEntries?: boolean;
   },
 ) {
   const normalizedQuery = options.query.trim().toLowerCase();
   const folderPrefix = options.folderPath ? `${options.folderPath}/` : "";
+  const includeArchiveEntries = options.includeArchiveEntries ?? true;
   const next: MediaItem[] = [];
 
   for (const item of items) {
+    if (!includeArchiveEntries && item.archivePath) {
+      continue;
+    }
     if (folderPrefix && !item.relativePath.startsWith(folderPrefix)) {
       continue;
     }
     if (options.kindFilter !== "all" && item.kind !== options.kindFilter) {
       continue;
     }
-    if (
-      normalizedQuery &&
-      !item.name.toLowerCase().includes(normalizedQuery) &&
-      !item.relativePath.toLowerCase().includes(normalizedQuery)
-    ) {
-      continue;
+    if (normalizedQuery) {
+      const haystack = `${item.name} ${item.relativePath}`.toLowerCase();
+      const orTerms = normalizedQuery
+        .split("|")
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .slice(0, 10);
+      const matches = orTerms.length
+        ? orTerms.some((orTerm) =>
+            orTerm
+              .split("&")
+              .map((part) => part.trim())
+              .filter(Boolean)
+              .every((andTerm) => haystack.includes(andTerm)),
+          )
+        : haystack.includes(normalizedQuery);
+      if (!matches) {
+        continue;
+      }
     }
     next.push(item);
   }
@@ -223,6 +243,10 @@ export function buildVisibleTreeEntries(
   if (!node) return [];
 
   const files = folderFiles.get(node.path) ?? [];
+  const zipBackedChildPaths = new Set(
+    files.filter((file) => file.kind === "zip").map((file) => file.relativePath),
+  );
+  const childPaths = node.children.filter((childPath) => !zipBackedChildPaths.has(childPath));
   const canExpand = node.children.length > 0 || files.length > 0;
   const isExpanded = expandedPaths.has(node.path);
   const entries: TreeVisibleEntry[] = [
@@ -251,7 +275,7 @@ export function buildVisibleTreeEntries(
     });
   }
 
-  for (const childPath of node.children) {
+  for (const childPath of childPaths) {
     entries.push(
       ...buildVisibleTreeEntries(childPath, nodes, expandedPaths, folderFiles, depth + 1),
     );

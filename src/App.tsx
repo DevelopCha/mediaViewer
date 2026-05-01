@@ -57,15 +57,65 @@ import {
   enqueueExtractVideoFrames,
   enqueueRemoveImageBackground,
   exportImageSequenceAnimation,
+  exportPortfolioSheet,
+  exportVideoBestCuts,
+  exportVideoContactSheet,
+  exportVideoLoopClip,
   listBackgroundTasks,
   onBackgroundTaskUpdate,
-  pickRootArchive,
   pickRootFolder,
   renameMediaFile,
+  resizeMediaFileWithPreset,
   scanMediaFolder,
+  splitVideoByScenes,
 } from "./lib/tauri-media";
+import mviewerWatermark from "./assets/mviewer-watermark.png";
 
 type PaneKey = "folders" | "preview";
+type ResizePresetKey =
+  | "square_1080"
+  | "story_1080x1920"
+  | "landscape_1920x1080"
+  | "thumb_1280x720";
+type LoopExportFormat = "mp4" | "gif" | "webp";
+type ActionDialogState =
+  | {
+      kind: "bestCuts";
+      item: MediaItem;
+      count: string;
+      threshold: string;
+    }
+  | {
+      kind: "contactSheet";
+      item: MediaItem;
+      columns: string;
+      rows: string;
+    }
+  | {
+      kind: "loopClip";
+      item: MediaItem;
+      startSeconds: string;
+      endSeconds: string;
+      format: LoopExportFormat;
+      fps: string;
+    }
+  | {
+      kind: "splitScenes";
+      item: MediaItem;
+      threshold: string;
+      minSceneSeconds: string;
+    }
+  | {
+      kind: "portfolioSheet";
+      columns: string;
+      imageCount: number;
+    }
+  | {
+      kind: "resizePreset";
+      presetKey: ResizePresetKey;
+      itemCount: number;
+      targetKinds: string;
+    };
 
 const IMAGE_ZOOM_MIN = 0.5;
 const IMAGE_ZOOM_MAX = 6;
@@ -79,6 +129,14 @@ const CONTEXT_MENU_WIDTH = 176;
 const CONTEXT_SUBMENU_WIDTH = 224;
 const MENU_VIEWPORT_MARGIN = 12;
 
+function formatSecondsLabel(value: number) {
+  const safe = Math.max(0, value);
+  const minutes = Math.floor(safe / 60);
+  const seconds = Math.floor(safe % 60);
+  const fraction = Math.round((safe - Math.floor(safe)) * 10);
+  return `${minutes}:${seconds.toString().padStart(2, "0")}.${fraction}`;
+}
+
 function buildItemMaps(items: MediaItem[]) {
   const byId = new Map<string, MediaItem>();
   const byPath = new Map<string, MediaItem>();
@@ -89,6 +147,23 @@ function buildItemMaps(items: MediaItem[]) {
   return { byId, byPath };
 }
 
+function firstBrowsableItem(items: MediaItem[]) {
+  return items.find((item) => !item.archivePath) ?? items[0] ?? null;
+}
+
+function isOpenableZipItem(item: MediaItem) {
+  return item.kind === "zip" && !item.archivePath;
+}
+
+function mapZipScanItemsToArchiveItems(zipItem: MediaItem, zipItems: MediaItem[]): MediaItem[] {
+  return zipItems.map((child) => ({
+    ...child,
+    archivePath: zipItem.path,
+    archiveEntryPath: child.relativePath,
+    relativePath: `${zipItem.relativePath}/${child.relativePath}`,
+  }));
+}
+
 function isArchiveRootPath(path: string) {
   return path.trim().toLowerCase().endsWith(".zip");
 }
@@ -97,6 +172,8 @@ function App() {
   const [kindFilter, setKindFilter] = useState<"all" | MediaKind>("all");
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("name");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
+  const [headerMenuOpen, setHeaderMenuOpen] = useState<"file" | "help" | "view" | null>(null);
   const [videoMuted, setVideoMuted] = useState(true);
   const [videoEyeMode, setVideoEyeMode] = useState<VideoEyeMode>("standard");
   const [videoVrLayoutSetting, setVideoVrLayoutSetting] =
@@ -116,6 +193,8 @@ function App() {
   const [viewerExpanded, setViewerExpanded] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
   const [showFolders, setShowFolders] = useState(true);
   const [showPreview, setShowPreview] = useState(true);
   const [folderWidth, setFolderWidth] = useState(DEFAULT_FOLDER_WIDTH);
@@ -140,9 +219,14 @@ function App() {
   const [animationPreviewPlaying, setAnimationPreviewPlaying] = useState(true);
   const [animationPreviewLoop, setAnimationPreviewLoop] = useState(true);
   const [animationPreviewFps, setAnimationPreviewFps] = useState(6);
+  const [animationPreviewReverse, setAnimationPreviewReverse] = useState(false);
   const [animationExporting, setAnimationExporting] = useState(false);
   const [animationContextMenu, setAnimationContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [actionDialog, setActionDialog] = useState<ActionDialogState | null>(null);
+  const [clipPreviewDuration, setClipPreviewDuration] = useState(0);
+  const [clipPreviewCurrentTime, setClipPreviewCurrentTime] = useState(0);
   const explorerRef = useRef<HTMLDivElement | null>(null);
+  const clipPreviewRef = useRef<HTMLVideoElement | null>(null);
   const dragStateRef = useRef<{
     startX: number;
     startY: number;
@@ -154,11 +238,19 @@ function App() {
     startWidth: number;
   } | null>(null);
   const backgroundRefreshTimeoutRef = useRef<number | null>(null);
+  const headerMenuRef = useRef<HTMLDivElement | null>(null);
 
   const deferredQuery = useDeferredValue(query);
+  const browsingZipFolder = isVirtualZipFolderPath(selectedFolderPath);
+  const listKindFilter = browsingZipFolder && kindFilter === "zip" ? "all" : kindFilter;
 
   const treeSourceItems = useMemo(
-    () => (kindFilter === "all" ? items : items.filter((item) => item.kind === kindFilter)),
+    () =>
+      kindFilter === "all"
+        ? items
+        : kindFilter === "zip"
+          ? items.filter((item) => item.kind === "zip" || item.archivePath)
+          : items.filter((item) => item.kind === kindFilter),
     [items, kindFilter],
   );
 
@@ -169,12 +261,121 @@ function App() {
 
   const selectedFolderNode = folderTree.get(selectedFolderPath) ?? folderTree.get("");
 
+  function isArchiveEntry(item: MediaItem) {
+    return Boolean(item.archivePath);
+  }
+
+  function isVirtualZipFolderPath(path: string) {
+    return path.toLowerCase().includes(".zip");
+  }
+
+  function zipFolderItems(path: string) {
+    return items.filter((item) => item.relativePath.startsWith(`${path}/`));
+  }
+
+  function expandFolderHierarchy(path: string) {
+    setExpandedFolderPaths((prev) => {
+      const next = new Set(prev);
+      next.add("");
+      let current = "";
+      for (const segment of path.split("/").filter(Boolean)) {
+        current = current ? `${current}/${segment}` : segment;
+        next.add(current);
+      }
+      return next;
+    });
+  }
+
+  function hasZipChildren(item: MediaItem) {
+    return (
+      item.kind === "zip" &&
+      items.some(
+        (candidate) =>
+          candidate.archivePath === item.path &&
+          candidate.relativePath.startsWith(`${item.relativePath}/`),
+      )
+    );
+  }
+
+  async function openZipItem(item: MediaItem) {
+    if (!isOpenableZipItem(item)) {
+      return false;
+    }
+
+    if (hasZipChildren(item)) {
+      expandFolderHierarchy(item.relativePath);
+      setSelectedFolderPath(item.relativePath);
+      setExplorerSelection({
+        type: "file",
+        id: item.id,
+        parentPath: parentFolderPath(item.relativePath),
+      });
+      setSelectedItemIds(new Set([item.id]));
+      setSelectionAnchorId(item.id);
+      setActiveId(item.id);
+      return true;
+    }
+
+    setIsLoading(true);
+    setErrorMessage("");
+
+    try {
+      const result = await scanMediaFolder(item.path);
+      const archiveItems = mapZipScanItemsToArchiveItems(item, result.items);
+
+      startTransition(() => {
+        setItems((prev) => {
+          const withoutOldArchiveItems = prev.filter(
+            (candidate) => candidate.archivePath !== item.path,
+          );
+          return [...withoutOldArchiveItems, ...archiveItems];
+        });
+      });
+
+      expandFolderHierarchy(item.relativePath);
+      if (kindFilter === "zip") {
+        setKindFilter("all");
+      }
+      setSelectedFolderPath(item.relativePath);
+      setExplorerSelection({
+        type: "file",
+        id: item.id,
+        parentPath: parentFolderPath(item.relativePath),
+      });
+      setSelectedItemIds(new Set([item.id]));
+      setSelectionAnchorId(item.id);
+      setActiveId(item.id);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to open the ZIP file.");
+      setActiveId(item.id);
+    } finally {
+      setIsLoading(false);
+    }
+
+    if (kindFilter === "zip") {
+      setKindFilter("all");
+    }
+    return true;
+  }
+
   function handleFolderSelect(path: string) {
+    if (kindFilter === "zip" && isVirtualZipFolderPath(path)) {
+      setKindFilter("all");
+    }
     setSelectedFolderPath(path);
     setExplorerSelection({ type: "folder", path });
-    const folderItems = treeSourceItems.filter((item) =>
-      path ? item.relativePath.startsWith(`${path}/`) : true,
+    const zipRootItem = items.find(
+      (item) => item.kind === "zip" && !item.archivePath && item.relativePath === path,
     );
+    const folderItems = isVirtualZipFolderPath(path)
+      ? zipFolderItems(path)
+      : treeSourceItems.filter((item) => (path ? item.relativePath.startsWith(`${path}/`) : true));
+    if (zipRootItem) {
+      setSelectedItemIds(new Set([zipRootItem.id]));
+      setSelectionAnchorId(zipRootItem.id);
+      setActiveId(zipRootItem.id);
+      return;
+    }
     setSelectedItemIds(new Set(folderItems.map((item) => item.id)));
     setSelectionAnchorId(folderItems[0]?.id ?? null);
     const node = folderTree.get(path);
@@ -191,10 +392,11 @@ function App() {
     () =>
       filterMediaItems(items, {
         folderPath: selectedFolderPath,
-        kindFilter,
+        kindFilter: listKindFilter,
         query: deferredQuery,
+        includeArchiveEntries: browsingZipFolder,
       }),
-    [deferredQuery, items, kindFilter, selectedFolderPath],
+    [browsingZipFolder, deferredQuery, items, listKindFilter, selectedFolderPath],
   );
 
   const treeFilteredItems = useMemo(
@@ -202,14 +404,21 @@ function App() {
       filterMediaItems(items, {
         kindFilter,
         query: deferredQuery,
+        includeArchiveEntries: true,
       }),
     [deferredQuery, items, kindFilter],
   );
 
-  const sorted = useMemo(() => sortMediaItems(filtered, sortKey), [filtered, sortKey]);
+  const sorted = useMemo(() => {
+    const next = sortMediaItems(filtered, sortKey);
+    return sortDirection === "asc" ? [...next].reverse() : next;
+  }, [filtered, sortDirection, sortKey]);
   const sortedTreeItems = useMemo(
-    () => sortMediaItems(treeFilteredItems, sortKey),
-    [sortKey, treeFilteredItems],
+    () => {
+      const next = sortMediaItems(treeFilteredItems, sortKey);
+      return sortDirection === "asc" ? [...next].reverse() : next;
+    },
+    [sortDirection, sortKey, treeFilteredItems],
   );
 
   const filesByFolder = useMemo(() => buildFilesByFolder(sortedTreeItems), [sortedTreeItems]);
@@ -225,6 +434,10 @@ function App() {
     () => selectedItems.filter((item) => item.kind === "video"),
     [selectedItems],
   );
+  const selectedImageItems = useMemo(
+    () => selectedItems.filter((item) => item.kind === "image"),
+    [selectedItems],
+  );
   const selectedItemCount = selectedItems.length;
 
   const active = useMemo(
@@ -236,6 +449,11 @@ function App() {
     [activeVideoDimensions, videoVrLayoutSetting],
   );
   const activeName = active ? active.name + active.ext : "Select a file";
+  const activeFullPath = active
+    ? active.archivePath && active.archiveEntryPath
+      ? `${active.archivePath} :: ${active.archiveEntryPath}`
+      : active.path
+    : "";
   const activeLocation = active
     ? active.relativePath
     : selectedFolderPath
@@ -254,6 +472,17 @@ function App() {
     setContextMenu(null);
     setContextSubmenu(null);
   }, [active?.id, deferredQuery, kindFilter, selectedFolderPath, sortKey]);
+
+  useEffect(() => {
+    if (!headerMenuOpen) return;
+    function onPointerDown(event: MouseEvent) {
+      if (!headerMenuRef.current?.contains(event.target as Node)) {
+        setHeaderMenuOpen(null);
+      }
+    }
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [headerMenuOpen]);
 
   useEffect(() => {
     if (!viewerExpanded || active?.kind !== "image") {
@@ -343,7 +572,8 @@ function App() {
         const preferred = findMediaByPath(result.items, preferredPath ?? null);
         const fallback =
           activeId && !preferredPath ? findMediaById(result.items, activeId) : null;
-        setActiveId(preferred?.id ?? fallback?.id ?? result.items[0]?.id ?? null);
+        const initial = firstBrowsableItem(result.items);
+        setActiveId(preferred?.id ?? fallback?.id ?? initial?.id ?? null);
       });
       return result;
     } catch (error) {
@@ -354,6 +584,38 @@ function App() {
     } finally {
       setIsLoading(false);
     }
+  }
+
+  function buildSearchQueryFromNames(names: string[]) {
+    return names
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .slice(0, 10)
+      .join(" | ");
+  }
+
+  function folderDisplayName(folderPath: string) {
+    if (!folderPath) {
+      return rootFolderName || "Root";
+    }
+    const segments = folderPath.split("/").filter(Boolean);
+    return segments[segments.length - 1] || folderPath;
+  }
+
+  function applySearchQueryFromContext() {
+    const names =
+      contextMenuSelectionItems.length > 0
+        ? contextMenuSelectionItems.map((item) => item.name)
+        : contextMenuFolderPath !== null
+          ? [folderDisplayName(contextMenuFolderPath)]
+          : contextMenuItem
+            ? [contextMenuItem.name]
+            : [];
+    const nextQuery = buildSearchQueryFromNames(names);
+    if (!nextQuery) return;
+    setQuery(nextQuery);
+    setContextSubmenu(null);
+    setContextMenu(null);
   }
 
   async function handlePickRootFolder() {
@@ -369,19 +631,6 @@ function App() {
     }
   }
 
-  async function handlePickZipArchive() {
-    setErrorMessage("");
-    try {
-      const selectedArchive = await pickRootArchive();
-      if (!selectedArchive) return;
-      await loadFolder(selectedArchive);
-    } catch (error) {
-      setErrorMessage(
-        error instanceof Error ? error.message : "Failed to open the ZIP picker.",
-      );
-    }
-  }
-
   function ensureWritableRoot(action: string) {
     if (!isArchiveRoot) {
       return true;
@@ -392,9 +641,41 @@ function App() {
     return false;
   }
 
+  function ensureWritableItems(action: string, targetItems: MediaItem[]) {
+    const archiveItem = targetItems.find((item) => isArchiveEntry(item));
+    if (!archiveItem) {
+      return true;
+    }
+    setErrorMessage(`${action} is disabled for files inside ZIP archives.`);
+    setContextMenu(null);
+    setContextSubmenu(null);
+    return false;
+  }
+
+  function ensureWritableFolderPath(action: string, folderPath: string) {
+    if (!isVirtualZipFolderPath(folderPath)) {
+      return true;
+    }
+    setErrorMessage(`${action} is disabled inside ZIP archives.`);
+    setContextMenu(null);
+    setContextSubmenu(null);
+    return false;
+  }
+
+  function preferredOutputRootForItems(targetItems: MediaItem[]) {
+    const archivePath = targetItems.find((item) => item.archivePath)?.archivePath;
+    if (!archivePath) {
+      return null;
+    }
+    const normalized = archivePath.replace(/\\/g, "/");
+    const slashIndex = normalized.lastIndexOf("/");
+    return slashIndex >= 0 ? archivePath.slice(0, slashIndex) : null;
+  }
+
   async function handleRename() {
     if (!active || !rootPath) return;
     if (!ensureWritableRoot("Rename")) return;
+    if (!ensureWritableItems("Rename", [active])) return;
     setIsSaving(true);
     setErrorMessage("");
 
@@ -414,6 +695,7 @@ function App() {
   async function deleteItem(item: MediaItem) {
     if (!rootPath) return;
     if (!ensureWritableRoot("Delete")) return;
+    if (!ensureWritableItems("Delete", [item])) return;
     const confirmed = window.confirm(`Delete "${item.name + item.ext}"?`);
     if (!confirmed) return;
 
@@ -436,6 +718,7 @@ function App() {
   async function deleteSelectedItems() {
     if (!rootPath || selectedItems.length === 0) return;
     if (!ensureWritableRoot("Delete")) return;
+    if (!ensureWritableItems("Delete", selectedItems)) return;
     const confirmed = window.confirm(`Delete ${selectedItems.length} selected item(s)?`);
     if (!confirmed) return;
 
@@ -472,6 +755,7 @@ function App() {
   async function duplicateItem(item: MediaItem) {
     if (!rootPath) return;
     if (!ensureWritableRoot("Duplicate")) return;
+    if (!ensureWritableItems("Duplicate", [item])) return;
     setErrorMessage("");
     setContextMenu(null);
 
@@ -488,6 +772,7 @@ function App() {
   async function createFolderAt(relativeFolderPath: string) {
     if (!rootPath) return;
     if (!ensureWritableRoot("Create folder")) return;
+    if (!ensureWritableFolderPath("Create folder", relativeFolderPath)) return;
     setErrorMessage("");
     setContextMenu(null);
 
@@ -514,6 +799,7 @@ function App() {
   async function duplicateFolderAt(relativeFolderPath: string) {
     if (!rootPath || !relativeFolderPath) return;
     if (!ensureWritableRoot("Duplicate folder")) return;
+    if (!ensureWritableFolderPath("Duplicate folder", relativeFolderPath)) return;
     setErrorMessage("");
     setContextMenu(null);
 
@@ -540,6 +826,7 @@ function App() {
   async function deleteFolderAt(relativeFolderPath: string) {
     if (!rootPath || !relativeFolderPath) return;
     if (!ensureWritableRoot("Delete folder")) return;
+    if (!ensureWritableFolderPath("Delete folder", relativeFolderPath)) return;
     const folderLabel = relativeFolderPath.split("/").pop() || relativeFolderPath;
     const confirmed = window.confirm(`Delete folder "${folderLabel}" and everything inside it?`);
     if (!confirmed) return;
@@ -559,7 +846,10 @@ function App() {
 
   async function handleRemoveBackground(item: MediaItem, engineKey: BackgroundEngineKey) {
     if (!rootPath) return;
-    if (!ensureWritableRoot("Background removal")) return;
+    if (!item.archivePath) {
+      if (!ensureWritableRoot("Background removal")) return;
+      if (!ensureWritableItems("Background removal", [item])) return;
+    }
     if (item.kind !== "image") {
       setErrorMessage("Background removal is only available for images.");
       setContextMenu(null);
@@ -571,7 +861,11 @@ function App() {
     setContextSubmenu(null);
 
     try {
-      const task = await enqueueRemoveImageBackground(item.path, engineKey);
+      const task = await enqueueRemoveImageBackground(
+        item.path,
+        engineKey,
+        preferredOutputRootForItems([item]),
+      );
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
     } catch (error) {
       setErrorMessage(
@@ -582,9 +876,12 @@ function App() {
 
   async function handleRemoveBackgroundSelected(engineKey: BackgroundEngineKey) {
     if (!rootPath || selectedItems.length === 0) return;
-    if (!ensureWritableRoot("Background removal")) return;
+    if (!selectedItems.some((item) => item.archivePath)) {
+      if (!ensureWritableRoot("Background removal")) return;
+      if (!ensureWritableItems("Background removal", selectedItems)) return;
+    }
 
-    const imageItems = selectedItems.filter((item) => item.kind === "image");
+    const imageItems = selectedImageItems;
     if (imageItems.length === 0) {
       setErrorMessage("Background removal is only available for selected images.");
       return;
@@ -596,7 +893,11 @@ function App() {
 
     try {
       for (const item of imageItems) {
-        const task = await enqueueRemoveImageBackground(item.path, engineKey);
+        const task = await enqueueRemoveImageBackground(
+          item.path,
+          engineKey,
+          preferredOutputRootForItems([item]),
+        );
         setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
       }
     } catch (error) {
@@ -608,7 +909,10 @@ function App() {
 
   async function handleExtractFrames(item: MediaItem, presetKey: FrameExtractPresetKey) {
     if (!rootPath) return;
-    if (!ensureWritableRoot("Frame extraction")) return;
+    if (!item.archivePath) {
+      if (!ensureWritableRoot("Frame extraction")) return;
+      if (!ensureWritableItems("Frame extraction", [item])) return;
+    }
     if (item.kind !== "video") {
       setErrorMessage("Frame extraction is only available for videos.");
       setContextMenu(null);
@@ -625,6 +929,7 @@ function App() {
         presetKey,
         videoEyeMode,
         currentExtractLayout(),
+        preferredOutputRootForItems([item]),
       );
       setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
     } catch (error) {
@@ -636,7 +941,10 @@ function App() {
 
   async function handleExtractFramesSelected(presetKey: FrameExtractPresetKey) {
     if (!rootPath || selectedItems.length === 0) return;
-    if (!ensureWritableRoot("Frame extraction")) return;
+    if (!selectedItems.some((item) => item.archivePath)) {
+      if (!ensureWritableRoot("Frame extraction")) return;
+      if (!ensureWritableItems("Frame extraction", selectedItems)) return;
+    }
     if (selectedVideoItems.length === 0) {
       setErrorMessage("Frame extraction is only available for selected videos.");
       return;
@@ -653,6 +961,7 @@ function App() {
           presetKey,
           videoEyeMode,
           currentExtractLayout(),
+          preferredOutputRootForItems([item]),
         );
         setBackgroundTasks((prev) => upsertBackgroundTask(prev, task));
       }
@@ -709,6 +1018,17 @@ function App() {
   }
 
   function selectSingleItem(item: MediaItem) {
+    if (isOpenableZipItem(item)) {
+      void openZipItem(item);
+      return;
+    }
+
+    if (hasZipChildren(item)) {
+      expandFolderHierarchy(item.relativePath);
+      handleFolderSelect(item.relativePath);
+      return;
+    }
+
     const parentPath = parentFolderPath(item.relativePath);
     setSelectedFolderPath(parentPath);
     setExplorerSelection({
@@ -722,6 +1042,17 @@ function App() {
   }
 
   function applyItemSelection(event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) {
+    if (!event.shiftKey && !(event.ctrlKey || event.metaKey) && isOpenableZipItem(item)) {
+      void openZipItem(item);
+      return;
+    }
+
+    if (!event.shiftKey && !(event.ctrlKey || event.metaKey) && hasZipChildren(item)) {
+      expandFolderHierarchy(item.relativePath);
+      handleFolderSelect(item.relativePath);
+      return;
+    }
+
     const parentPath = parentFolderPath(item.relativePath);
     setSelectedFolderPath(parentPath);
     setExplorerSelection({
@@ -851,8 +1182,9 @@ function App() {
 
   const animationPreviewItems = useMemo(() => {
     const frameSet = new Set(animationPreviewFrameIds);
-    return selectionOrderedItems.filter((item) => frameSet.has(item.id) && item.kind === "image");
-  }, [animationPreviewFrameIds, selectionOrderedItems]);
+    const ordered = selectionOrderedItems.filter((item) => frameSet.has(item.id) && item.kind === "image");
+    return animationPreviewReverse ? [...ordered].reverse() : ordered;
+  }, [animationPreviewFrameIds, animationPreviewReverse, selectionOrderedItems]);
 
   const currentAnimationFrame = animationPreviewItems[animationPreviewIndex] ?? null;
   const currentAnimationFrameUrl = currentAnimationFrame ? assetUrl(currentAnimationFrame.path) : "";
@@ -955,12 +1287,15 @@ function App() {
     setAnimationPreviewPlaying(true);
     setAnimationPreviewLoop(true);
     setAnimationPreviewFps(6);
+    setAnimationPreviewReverse(false);
     setAnimationPreviewOpen(true);
   }
 
   async function exportAnimationFromPreview(format: AnimationExportFormat) {
     if (animationPreviewItems.length < 2) return;
-    if (!ensureWritableRoot("Animation export")) return;
+    if (!animationPreviewItems.some((item) => item.archivePath)) {
+      if (!ensureWritableRoot("Animation export")) return;
+    }
 
     setAnimationExporting(true);
     setAnimationContextMenu(null);
@@ -971,6 +1306,8 @@ function App() {
         animationPreviewItems.map((item) => item.path),
         format,
         animationPreviewFps,
+        false,
+        preferredOutputRootForItems(animationPreviewItems),
       );
       if (rootPath) {
         await loadFolder(rootPath, outputPath, { preserveSelection: true });
@@ -982,6 +1319,310 @@ function App() {
     } finally {
       setAnimationExporting(false);
     }
+  }
+
+  async function runAndReload(action: string, work: () => Promise<string>) {
+    setIsSaving(true);
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+
+    try {
+      const outputPath = await work();
+      if (rootPath) {
+        await loadFolder(rootPath, outputPath, { preserveSelection: true });
+      }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : `Failed to complete ${action}.`,
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  function openBestCutsDialog(item: MediaItem) {
+    if (!rootPath) return;
+    if (!item.archivePath) {
+      if (!ensureWritableRoot("Best-cut extraction")) return;
+      if (!ensureWritableItems("Best-cut extraction", [item])) return;
+    }
+    if (item.kind !== "video") {
+      setErrorMessage("Best-cut extraction is only available for videos.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setActionDialog({ kind: "bestCuts", item, count: "8", threshold: "0.32" });
+  }
+
+  function openVideoContactSheetDialog(item: MediaItem) {
+    if (!rootPath) return;
+    if (!item.archivePath) {
+      if (!ensureWritableRoot("Contact sheet")) return;
+      if (!ensureWritableItems("Contact sheet", [item])) return;
+    }
+    if (item.kind !== "video") {
+      setErrorMessage("Contact sheet export is only available for videos.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setActionDialog({ kind: "contactSheet", item, columns: "4", rows: "4" });
+  }
+
+  function openLoopClipDialog(item: MediaItem) {
+    if (!rootPath) return;
+    if (!item.archivePath) {
+      if (!ensureWritableRoot("Loop clip export")) return;
+      if (!ensureWritableItems("Loop clip export", [item])) return;
+    }
+    if (item.kind !== "video") {
+      setErrorMessage("Loop clip export is only available for videos.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setActionDialog({
+      kind: "loopClip",
+      item,
+      startSeconds: "0",
+      endSeconds: "2.5",
+      format: "mp4",
+      fps: "15",
+    });
+    setClipPreviewCurrentTime(0);
+    setClipPreviewDuration(0);
+  }
+
+  function openSplitScenesDialog(item: MediaItem) {
+    if (!rootPath) return;
+    if (!item.archivePath) {
+      if (!ensureWritableRoot("Scene split")) return;
+      if (!ensureWritableItems("Scene split", [item])) return;
+    }
+    if (item.kind !== "video") {
+      setErrorMessage("Scene split is only available for videos.");
+      return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setActionDialog({
+      kind: "splitScenes",
+      item,
+      threshold: "0.35",
+      minSceneSeconds: "1.2",
+    });
+  }
+
+  function openPortfolioSheetDialog() {
+    if (!rootPath || selectedImageItems.length < 2) {
+      setErrorMessage("Select at least two images to create a portfolio sheet.");
+      return;
+    }
+    if (!selectedImageItems.some((item) => item.archivePath)) {
+      if (!ensureWritableRoot("Portfolio sheet")) return;
+      if (!ensureWritableItems("Portfolio sheet", selectedImageItems)) return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setActionDialog({
+      kind: "portfolioSheet",
+      columns: "3",
+      imageCount: selectedImageItems.length,
+    });
+  }
+
+  function openResizePresetDialog() {
+    if (!rootPath || selectedItems.length === 0) {
+      setErrorMessage("Select at least one item to resize.");
+      return;
+    }
+    if (!selectedItems.some((item) => item.archivePath)) {
+      if (!ensureWritableRoot("Resize export")) return;
+      if (!ensureWritableItems("Resize export", selectedItems)) return;
+    }
+
+    setErrorMessage("");
+    setContextMenu(null);
+    setContextSubmenu(null);
+    setActionDialog({
+      kind: "resizePreset",
+      presetKey: "square_1080",
+      itemCount: selectedItems.length,
+      targetKinds: Array.from(new Set(selectedItems.map((item) => item.kind))).join(", "),
+    });
+  }
+
+  async function submitActionDialog() {
+    if (!actionDialog) return;
+
+    if (actionDialog.kind === "bestCuts") {
+      const count = Number(actionDialog.count);
+      const threshold = Number(actionDialog.threshold);
+      if (!Number.isFinite(count) || count < 1 || !Number.isFinite(threshold)) {
+        setErrorMessage("Enter a valid cut count and scene sensitivity.");
+        return;
+      }
+      setActionDialog(null);
+      await runAndReload("best-cut extraction", () =>
+        exportVideoBestCuts(
+          actionDialog.item.path,
+          Math.max(1, Math.round(count)),
+          threshold,
+          preferredOutputRootForItems([actionDialog.item]),
+        ),
+      );
+      return;
+    }
+
+    if (actionDialog.kind === "contactSheet") {
+      const columns = Number(actionDialog.columns);
+      const rows = Number(actionDialog.rows);
+      if (!Number.isFinite(columns) || !Number.isFinite(rows) || columns < 1 || rows < 1) {
+        setErrorMessage("Enter valid column and row counts.");
+        return;
+      }
+      setActionDialog(null);
+      await runAndReload("contact sheet export", () =>
+        exportVideoContactSheet(
+          actionDialog.item.path,
+          Math.round(columns),
+          Math.round(rows),
+          preferredOutputRootForItems([actionDialog.item]),
+        ),
+      );
+      return;
+    }
+
+    if (actionDialog.kind === "loopClip") {
+      const startSeconds = Number(actionDialog.startSeconds);
+      const endSeconds = Number(actionDialog.endSeconds);
+      const fps = Number(actionDialog.fps);
+      if (
+        !Number.isFinite(startSeconds) ||
+        !Number.isFinite(endSeconds) ||
+        !Number.isFinite(fps) ||
+        fps < 1 ||
+        endSeconds <= startSeconds
+      ) {
+        setErrorMessage("Choose a valid start, end, and FPS.");
+        return;
+      }
+      setActionDialog(null);
+      await runAndReload("loop clip export", () =>
+        exportVideoLoopClip(
+          actionDialog.item.path,
+          startSeconds,
+          endSeconds - startSeconds,
+          actionDialog.format,
+          Math.round(fps),
+          preferredOutputRootForItems([actionDialog.item]),
+        ),
+      );
+      return;
+    }
+
+    if (actionDialog.kind === "splitScenes") {
+      const threshold = Number(actionDialog.threshold);
+      const minSceneSeconds = Number(actionDialog.minSceneSeconds);
+      if (!Number.isFinite(threshold) || !Number.isFinite(minSceneSeconds) || minSceneSeconds <= 0) {
+        setErrorMessage("Enter a valid scene sensitivity and minimum scene length.");
+        return;
+      }
+      setActionDialog(null);
+      await runAndReload("scene split", () =>
+        splitVideoByScenes(
+          actionDialog.item.path,
+          threshold,
+          minSceneSeconds,
+          preferredOutputRootForItems([actionDialog.item]),
+        ),
+      );
+      return;
+    }
+
+    if (actionDialog.kind === "portfolioSheet") {
+      const columns = Number(actionDialog.columns);
+      if (!Number.isFinite(columns) || columns < 1) {
+        setErrorMessage("Enter a valid portfolio column count.");
+        return;
+      }
+      const orderedImagePaths = selectionOrderedItems
+        .filter((item) => selectedItemIds.has(item.id) && item.kind === "image")
+        .map((item) => item.path);
+      setActionDialog(null);
+      const exportItems = selectionOrderedItems.filter(
+        (item) => selectedItemIds.has(item.id) && item.kind === "image",
+      );
+      await runAndReload("portfolio sheet export", () =>
+        exportPortfolioSheet(
+          orderedImagePaths,
+          Math.round(columns),
+          preferredOutputRootForItems(exportItems),
+        ),
+      );
+      return;
+    }
+
+    if (actionDialog.kind === "resizePreset") {
+      setActionDialog(null);
+      setIsSaving(true);
+      setErrorMessage("");
+      try {
+        let lastOutputPath = "";
+        for (const item of selectedItems) {
+          lastOutputPath = await resizeMediaFileWithPreset(
+            item.path,
+            actionDialog.presetKey,
+            preferredOutputRootForItems([item]),
+          );
+        }
+        if (rootPath) {
+          await loadFolder(rootPath, lastOutputPath || null, { preserveSelection: true });
+        }
+      } catch (error) {
+        setErrorMessage(
+          error instanceof Error ? error.message : "Failed to export the resized media.",
+        );
+      } finally {
+        setIsSaving(false);
+      }
+    }
+  }
+
+  async function handleResizeSelection() {
+    openResizePresetDialog();
+  }
+
+  async function handleExportPortfolioSheet() {
+    openPortfolioSheetDialog();
+  }
+
+  async function handleExportBestCuts(item: MediaItem) {
+    openBestCutsDialog(item);
+  }
+
+  async function handleExportVideoContactSheet(item: MediaItem) {
+    openVideoContactSheetDialog(item);
+  }
+
+  async function handleExportLoopClip(item: MediaItem) {
+    openLoopClipDialog(item);
+  }
+
+  async function handleSplitVideoScenes(item: MediaItem) {
+    openSplitScenesDialog(item);
   }
 
   function handleTreeFileSelect(event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) {
@@ -1126,6 +1767,33 @@ function App() {
     return resolvedVideoVrLayout;
   }
 
+  const emptyPreviewContent = (
+    <div className="relative flex h-full w-full items-center justify-center overflow-hidden">
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <div className="mb-14 flex items-center gap-0 opacity-[0.13] saturate-75">
+          <div className="relative h-[190px] w-[320px] overflow-hidden">
+            <img
+              src={mviewerWatermark}
+              alt=""
+              aria-hidden="true"
+              className="absolute left-0 top-1/2 h-[190px] max-w-none -translate-y-1/2 select-none"
+            />
+          </div>
+          <div className="-ml-3 text-[clamp(2.2rem,4.3vw,4rem)] font-semibold tracking-[-0.05em] text-zinc-200">
+            MediaViewer
+          </div>
+        </div>
+      </div>
+
+      <div className="relative z-10 mt-[22rem] px-6 text-center text-zinc-400">
+        <div className="text-lg font-semibold">Nothing selected</div>
+        <div className="mt-2 text-sm">
+          Pick a folder or ZIP archive and choose a file from the list.
+        </div>
+      </div>
+    </div>
+  );
+
   const previewContent = active ? (
     active.kind === "image" ? (
       <img
@@ -1133,17 +1801,17 @@ function App() {
         alt={active.name}
         className="max-h-full max-w-full object-contain"
       />
-    ) : (
+    ) : active.kind === "video" ? (
       renderVideoPreview()
-    )
-  ) : (
-    <div className="text-center text-zinc-400">
-      <div className="text-lg font-semibold">Nothing selected</div>
-      <div className="mt-2 text-sm">
-        Pick a folder or ZIP archive and choose a file from the list.
+    ) : (
+      <div className="text-center text-zinc-400">
+        <div className="text-lg font-semibold">ZIP archive selected</div>
+        <div className="mt-2 text-sm">ZIP preview and expand are not enabled yet.</div>
       </div>
-    </div>
-  );
+    )
+  ) : emptyPreviewContent;
+
+  const mainPanelContent = showPreview ? previewContent : emptyPreviewContent;
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -1161,6 +1829,11 @@ function App() {
         if (contextMenu) {
           event.preventDefault();
           setContextMenu(null);
+          return;
+        }
+        if (actionDialog) {
+          event.preventDefault();
+          setActionDialog(null);
           return;
         }
         if (renameOpen) {
@@ -1237,6 +1910,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     active,
+    actionDialog,
     animationContextMenu,
     animationPreviewItems,
     animationPreviewOpen,
@@ -1367,20 +2041,30 @@ function App() {
     contextMenu?.target === "item" ? findMediaById(items, contextMenu.itemId) : null;
   const contextMenuFolderPath = contextMenu?.target === "folder" ? contextMenu.folderPath : null;
   const contextMenuSelectionItems =
-    contextMenuItem && selectedItemIds.has(contextMenuItem.id) && selectedItemCount > 1
+    contextMenu?.target === "folder"
       ? selectedItems
-      : contextMenuItem
-        ? [contextMenuItem]
-        : [];
+      : contextMenuItem && selectedItemIds.has(contextMenuItem.id) && selectedItemCount > 1
+        ? selectedItems
+        : contextMenuItem
+          ? [contextMenuItem]
+          : [];
   const contextMenuSelectionImages = contextMenuSelectionItems.filter((item) => item.kind === "image");
   const contextMenuSelectionVideos = contextMenuSelectionItems.filter((item) => item.kind === "video");
-  const contextMenuEntryCount = contextMenuFolderPath !== null
-    ? 1 + (contextMenuFolderPath ? 2 : 0)
-    : (contextMenuItem?.kind === "image" ? 1 : 0) +
-      (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
-      (contextMenuItem?.kind === "video" ? 1 : 0) +
-      (contextMenuSelectionItems.length === 1 ? 2 : 0) +
-      1;
+  const contextMenuSingleVideo =
+    contextMenuSelectionVideos.length === 1 ? contextMenuSelectionVideos[0] : null;
+  const contextMenuFolderWritable =
+    contextMenuFolderPath !== null && !isVirtualZipFolderPath(contextMenuFolderPath);
+  const folderEntryCount = contextMenuFolderWritable ? 1 + (contextMenuFolderPath ? 2 : 0) : 0;
+  const fileActionEntryCount =
+    (contextMenuSelectionImages.length >= 1 ? 1 : 0) +
+    (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
+    (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
+    (contextMenuSingleVideo ? 4 : 0) +
+    (contextMenuSelectionVideos.length >= 1 ? 1 : 0) +
+    (contextMenuSelectionItems.length >= 1 ? 1 : 0) +
+    (contextMenuItem && contextMenuSelectionItems.length === 1 ? 2 : 0) +
+    (contextMenuSelectionItems.length >= 1 ? 1 : 0);
+  const contextMenuEntryCount = folderEntryCount + fileActionEntryCount;
   const contextMenuPosition = contextMenu
     ? clampMenuPosition(contextMenu.x, contextMenu.y, CONTEXT_MENU_WIDTH, 16 + contextMenuEntryCount * 38)
     : null;
@@ -1391,12 +2075,22 @@ function App() {
         : contextMenuPosition.x - CONTEXT_SUBMENU_WIDTH - 6
       : 0;
   const backgroundSubmenuPosition =
-    contextMenuPosition && contextMenuItem?.kind === "image"
+    contextMenuPosition && contextMenuSelectionImages.length >= 1
       ? clampMenuPosition(contextSubmenuX, contextMenuPosition.y, CONTEXT_SUBMENU_WIDTH, 16 + BACKGROUND_ENGINES.length * 38)
       : null;
+  const imageActionOffset = (contextMenuSelectionImages.length >= 1 ? 1 : 0) * 34;
+  const imageBatchOffset =
+    (contextMenuSelectionImages.length >= 2 ? 1 : 0) * 34 +
+    (contextMenuSelectionImages.length >= 2 ? 1 : 0) * 34;
+  const videoActionOffset = (contextMenuSingleVideo ? 4 : 0) * 34;
   const extractSubmenuPosition =
-    contextMenuPosition && contextMenuItem?.kind === "video"
-      ? clampMenuPosition(contextSubmenuX, contextMenuPosition.y + 34, CONTEXT_SUBMENU_WIDTH, 16 + FRAME_EXTRACT_PRESETS.length * 38)
+    contextMenuPosition && contextMenuSelectionVideos.length >= 1
+      ? clampMenuPosition(
+          contextSubmenuX,
+          contextMenuPosition.y + imageActionOffset + imageBatchOffset + videoActionOffset,
+          CONTEXT_SUBMENU_WIDTH,
+          16 + FRAME_EXTRACT_PRESETS.length * 38,
+        )
       : null;
   const selectedExplorerKey =
     explorerSelection.type === "file"
@@ -1407,6 +2101,45 @@ function App() {
   const finishedTaskCount = backgroundTasks.filter(
     (task) => task.status === "completed" || task.status === "failed",
   ).length;
+  const actionDialogTitle =
+    actionDialog?.kind === "bestCuts"
+      ? "Extract Best Cuts"
+      : actionDialog?.kind === "contactSheet"
+        ? "Create Contact Sheet"
+        : actionDialog?.kind === "loopClip"
+          ? "Extract Clip"
+          : actionDialog?.kind === "splitScenes"
+            ? "Split by Scenes"
+            : actionDialog?.kind === "portfolioSheet"
+              ? "Create Portfolio Sheet"
+              : actionDialog?.kind === "resizePreset"
+                ? "Resize with Preset"
+                : "";
+  const actionDialogDescription =
+    actionDialog?.kind === "bestCuts"
+      ? "Pick how many representative frames to save and how sensitive the scene change detection should be."
+      : actionDialog?.kind === "contactSheet"
+        ? "Create one summary image from evenly sampled frames in the selected video."
+        : actionDialog?.kind === "loopClip"
+          ? "Preview the video, mark the start and end points, then choose an output format and FPS."
+          : actionDialog?.kind === "splitScenes"
+            ? "Cut the video into separate scene clips based on visual scene changes."
+            : actionDialog?.kind === "portfolioSheet"
+              ? "Lay out the selected images into one sheet for easy comparison."
+              : actionDialog?.kind === "resizePreset"
+                ? "Apply a ready-made output size to every selected image or video."
+                : "";
+  const clipDialogStartValue =
+    actionDialog?.kind === "loopClip"
+      ? Math.min(
+          Math.max(0, Number(actionDialog.startSeconds) || 0),
+          clipPreviewDuration || Number(actionDialog.endSeconds) || 0,
+        )
+      : 0;
+  const clipDialogEndValue =
+    actionDialog?.kind === "loopClip"
+      ? Math.max(clipDialogStartValue, Number(actionDialog.endSeconds) || 0)
+      : 0;
 
   useEffect(() => {
     const container = explorerRef.current;
@@ -1418,41 +2151,135 @@ function App() {
   }, [selectedExplorerKey, visibleTreeEntries]);
 
   return (
-    <div className="dark h-dvh w-dvw overflow-hidden bg-zinc-100 text-[12px] text-zinc-950 dark:bg-[#0d0d10] dark:text-zinc-50">
-      <div className="absolute right-3 top-3 z-30 flex items-center gap-2 rounded-xl border border-zinc-800 bg-[#121217]/92 p-1.5 shadow-lg backdrop-blur">
-        <div className="px-1 text-[9px] font-semibold uppercase tracking-[0.18em] text-zinc-500">
-          Layout
-        </div>
-        {(
-          [
-            ["folders", "Folders", showFolders],
-            ["preview", "Preview", showPreview],
-          ] as const
-        ).map(([pane, label, visible]) => (
-          <button
-            key={pane}
-            type="button"
-            onClick={() => togglePane(pane)}
-            className={classNames(
-              "rounded-md px-2 py-1 text-[10px] transition",
-              visible
-                ? "bg-white text-zinc-950"
-                : "border border-zinc-800 bg-zinc-950 text-zinc-300 hover:bg-zinc-900",
-            )}
-          >
-            {label}
-          </button>
-        ))}
-        <button
-          type="button"
-          onClick={resetLayout}
-          className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px] text-zinc-300 hover:bg-zinc-900"
-        >
-          Reset
-        </button>
-      </div>
+    <div className="dark relative h-dvh w-dvw overflow-hidden bg-zinc-100 text-[12px] text-zinc-950 dark:bg-[#0d0d10] dark:text-zinc-50">
+      <div className="relative z-10 flex h-full w-full flex-col">
+        <header className="shrink-0 border-b border-zinc-200 bg-white/90 px-3 py-2 dark:border-zinc-800 dark:bg-[#121217]/96">
+          <div className="flex items-center justify-between gap-3">
+            <div ref={headerMenuRef} className="flex items-center gap-2">
+              <div className="pr-2 text-[15px] font-semibold">MViewer</div>
+              {(
+                [
+                  ["file", "File"],
+                  ["view", "View"],
+                  ["help", "Help"],
+                ] as const
+              ).map(([key, label]) => (
+                <div key={key} className="relative">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setHeaderMenuOpen((prev) => (prev === key ? null : key))
+                    }
+                    className="rounded-md px-2 py-1 text-[11px] text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+                  >
+                    {label}
+                  </button>
+                  {headerMenuOpen === key ? (
+                    <div className="absolute left-0 top-[calc(100%+6px)] z-50 min-w-44 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl">
+                      {key === "file" ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              void handlePickRootFolder();
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            Choose Folder
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              setQuery("");
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            Clear Search
+                          </button>
+                        </>
+                      ) : null}
+                      {key === "view" ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              togglePane("folders");
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            {showFolders ? "Hide Folders" : "Show Folders"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              togglePane("preview");
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            {showPreview ? "Hide Preview" : "Show Preview"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              resetLayout();
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            Reset Layout
+                          </button>
+                        </>
+                      ) : null}
+                      {key === "help" ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              setAboutOpen(true);
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            Program Info
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHeaderMenuOpen(null);
+                              setManualOpen(true);
+                            }}
+                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                          >
+                            Manual
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
 
-      <div className="flex h-full w-full">
+            <div className="flex min-w-0 flex-1 items-center justify-center px-2">
+              <div className="flex w-full max-w-xl items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950/80">
+                <div className="text-[10px] uppercase tracking-[0.18em] text-zinc-500">Search</div>
+                <input
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search files, folders, ZIP contents"
+                  className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-zinc-500"
+                />
+              </div>
+            </div>
+            <div className="w-[120px]" />
+          </div>
+        </header>
+
+        <div className="flex min-h-0 flex-1">
         {showFolders ? (
         <aside
           className="flex min-h-0 shrink-0 flex-col border-r border-zinc-200 bg-white/90 dark:border-zinc-800 dark:bg-[#121217]"
@@ -1460,13 +2287,12 @@ function App() {
         >
           <div className="shrink-0 border-b border-zinc-200 p-3 dark:border-zinc-800">
               <div className="flex items-center gap-2">
-                <div className="shrink-0 text-[14px] font-semibold">Media Vault</div>
                 <div className="min-w-0 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
                   {rootFolderName || "No folder"}{rootPath ? ` / ${rootPath}` : ""}
                 </div>
               </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2">
+            <div className="mt-3">
               <button
                 className="w-full rounded-lg bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-zinc-800 disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
                 type="button"
@@ -1475,57 +2301,38 @@ function App() {
               >
                 {isLoading ? "Scanning..." : "Choose Folder"}
               </button>
-              <button
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-zinc-200 hover:bg-zinc-900 disabled:cursor-wait disabled:opacity-70"
-                type="button"
-                onClick={handlePickZipArchive}
-                disabled={isLoading || isSaving}
-              >
-                {isLoading ? "Scanning..." : "Open ZIP"}
-              </button>
             </div>
 
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-3 pt-2">
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search files"
-              className="shrink-0 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[12px] outline-none placeholder:text-zinc-500 focus:border-zinc-600"
-            />
-
-            <div className="mt-2.5 flex shrink-0 items-center gap-2">
-              {(
-                [
-                  ["all", "All"],
-                  ["image", "Images"],
-                  ["video", "Videos"],
-                ] as const
-              ).map(([key, label]) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setKindFilter(key)}
-                  className={classNames(
-                    "rounded-md px-2.5 py-1 text-[10px]",
-                    kindFilter === key
-                      ? "bg-white text-zinc-950"
-                      : "border border-zinc-800 bg-zinc-950 hover:bg-zinc-900",
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-
+            <div className="mt-2.5 grid shrink-0 grid-cols-3 gap-2">
               <select
-                className="ml-auto rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
+                className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
+                value={kindFilter}
+                onChange={(event) => setKindFilter(event.target.value as "all" | MediaKind)}
+              >
+                <option value="all">All</option>
+                <option value="image">Image</option>
+                <option value="video">Video</option>
+                <option value="zip">ZIP</option>
+              </select>
+              <select
+                className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
                 value={sortKey}
                 onChange={(event) => setSortKey(event.target.value as SortKey)}
               >
                 <option value="date">Date</option>
                 <option value="name">Name</option>
                 <option value="size">Size</option>
+              </select>
+              <select
+                className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
+                value={sortDirection}
+                onChange={(event) => setSortDirection(event.target.value as "asc" | "desc")}
+              >
+                <option value="desc">Desc</option>
+                <option value="asc">Asc</option>
               </select>
             </div>
 
@@ -1595,76 +2402,81 @@ function App() {
           </div>
         ) : null}
 
-        {showPreview ? (
         <main className="flex min-h-0 flex-1 flex-col bg-zinc-200/40 dark:bg-[#0b0b0d]">
-          <div className="border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
-            <div className="text-[9px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">
-              Preview
-            </div>
-            <div className="mt-1 flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="truncate text-[14px] font-semibold">
-                  {activeName}
-                </div>
-                <div className="mt-0.5 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                  {activeLocation}
-                </div>
+          {showPreview ? (
+            <div className="border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+              <div className="text-[9px] uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">
+                Preview
               </div>
-              {active ? (
-                <div className="flex shrink-0 items-center gap-2">
-                  <div className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] dark:border-zinc-800 dark:bg-zinc-950">
-                    {active.kind === "video" ? "Video" : "Image"}
+              <div className="mt-1 flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="truncate text-[14px] font-semibold">
+                    {activeName}
                   </div>
-                  {active.kind === "video" ? (
-                    <>
-                      {(
-                        [
-                          ["standard", "Standard"],
-                          ["left", "Left Eye"],
-                          ["right", "Right Eye"],
-                        ] as const
-                      ).map(([mode, label]) => (
-                        <button
-                          key={mode}
-                          type="button"
-                          onClick={() => setVideoEyeMode(mode)}
-                          className={classNames(
-                            "rounded-full border px-2.5 py-1 text-[10px]",
-                            videoEyeMode === mode
-                              ? "border-sky-700 bg-sky-950/70 text-sky-100"
-                              : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
-                          )}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        onClick={cycleVideoVrLayout}
-                        className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
-                      >
-                        Layout {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
-                      </button>
-                    </>
-                  ) : null}
-                  <button
-                    type="button"
-                    onClick={() => setInfoOpen(true)}
-                    className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
-                  >
-                    Info
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setViewerExpanded(true)}
-                    className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
-                  >
-                    Expand
-                  </button>
+                  <div className="mt-0.5 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
+                    {activeLocation}
+                  </div>
                 </div>
-              ) : null}
+                {active ? (
+                  <div className="flex shrink-0 items-center gap-2">
+                    <div className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] dark:border-zinc-800 dark:bg-zinc-950">
+                      {active.kind === "video"
+                        ? "Video"
+                        : active.kind === "zip"
+                          ? "ZIP Archive"
+                          : "Image"}
+                    </div>
+                    {active.kind === "video" ? (
+                      <>
+                        {(
+                          [
+                            ["standard", "Standard"],
+                            ["left", "Left Eye"],
+                            ["right", "Right Eye"],
+                          ] as const
+                        ).map(([mode, label]) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => setVideoEyeMode(mode)}
+                            className={classNames(
+                              "rounded-full border px-2.5 py-1 text-[10px]",
+                              videoEyeMode === mode
+                                ? "border-sky-700 bg-sky-950/70 text-sky-100"
+                                : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
+                            )}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          onClick={cycleVideoVrLayout}
+                          className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
+                        >
+                          Layout {videoVrLayoutSetting === "auto" ? "Auto" : resolvedVideoVrLayout.toUpperCase()}
+                        </button>
+                      </>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => setInfoOpen(true)}
+                      className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
+                    >
+                      Info
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setViewerExpanded(true)}
+                      className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900"
+                    >
+                      Expand
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
-          </div>
+          ) : null}
 
           <div className="min-h-0 flex-1 p-2">
             <div className="relative h-full">
@@ -1672,10 +2484,10 @@ function App() {
                 className="flex h-full items-center justify-center overflow-hidden rounded-3xl border border-zinc-200 bg-black shadow-sm dark:border-zinc-800"
                 onDoubleClick={() => active && setViewerExpanded(true)}
               >
-                {previewContent}
+                {mainPanelContent}
               </div>
 
-              {active ? (
+              {showPreview && active ? (
                 <>
                   <button
                     type="button"
@@ -1698,7 +2510,7 @@ function App() {
             </div>
           </div>
         </main>
-        ) : null}
+        </div>
       </div>
 
       {errorMessage ? (
@@ -1778,23 +2590,19 @@ function App() {
                 </div>
 
                 <div className="mt-2 h-2 overflow-hidden rounded-full bg-zinc-800">
-                  {task.status === "running" ? (
-                    <div className="relative h-full w-full overflow-hidden rounded-full bg-sky-950">
-                      <div className="absolute inset-y-0 left-0 w-1/3 animate-pulse rounded-full bg-sky-400" />
-                    </div>
-                  ) : (
-                    <div
-                      className={classNames(
-                        "h-full rounded-full transition-all duration-300",
-                        task.status === "completed"
-                          ? "bg-emerald-400"
-                          : task.status === "failed"
-                            ? "bg-red-400"
+                  <div
+                    className={classNames(
+                      "h-full rounded-full transition-all duration-300",
+                      task.status === "completed"
+                        ? "bg-emerald-400"
+                        : task.status === "failed"
+                          ? "bg-red-400"
+                          : task.status === "running"
+                            ? "bg-sky-400"
                             : "bg-zinc-500",
-                      )}
-                      style={{ width: `${Math.max(task.progress, task.status === "queued" ? 6 : 0)}%` }}
-                    />
-                  )}
+                    )}
+                    style={{ width: `${Math.max(task.progress, task.status === "queued" ? 6 : 0)}%` }}
+                  />
                 </div>
 
                 <div className="mt-2 flex items-center justify-between gap-3 text-[10px] text-zinc-500">
@@ -1849,7 +2657,7 @@ function App() {
             className="fixed z-40 min-w-44 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
             style={{ left: `${contextMenuPosition?.x ?? 0}px`, top: `${contextMenuPosition?.y ?? 0}px` }}
           >
-            {contextMenuFolderPath !== null ? (
+            {contextMenuFolderPath !== null && contextMenuFolderWritable ? (
               <>
                 <button
                   type="button"
@@ -1878,7 +2686,7 @@ function App() {
                 ) : null}
               </>
             ) : null}
-            {contextMenuItem?.kind === "image" ? (
+            {contextMenuSelectionImages.length >= 1 ? (
               <button
                 type="button"
                 onMouseEnter={() => setContextSubmenu("background-remove")}
@@ -1906,7 +2714,52 @@ function App() {
                 {`Animation Preview (${contextMenuSelectionImages.length})`}
               </button>
             ) : null}
-            {contextMenuItem?.kind === "video" ? (
+            {contextMenuSelectionImages.length >= 2 ? (
+              <button
+                type="button"
+                onClick={() => void handleExportPortfolioSheet()}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                {`Portfolio Sheet (${contextMenuSelectionImages.length})`}
+              </button>
+            ) : null}
+            {contextMenuSingleVideo ? (
+              <button
+                type="button"
+                onClick={() => void handleExportBestCuts(contextMenuSingleVideo)}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                Auto Best Cuts
+              </button>
+            ) : null}
+            {contextMenuSingleVideo ? (
+              <button
+                type="button"
+                onClick={() => void handleExportVideoContactSheet(contextMenuSingleVideo)}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                Video Contact Sheet
+              </button>
+            ) : null}
+            {contextMenuSingleVideo ? (
+              <button
+                type="button"
+                onClick={() => void handleExportLoopClip(contextMenuSingleVideo)}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                Extract Clip
+              </button>
+            ) : null}
+            {contextMenuSingleVideo ? (
+              <button
+                type="button"
+                onClick={() => void handleSplitVideoScenes(contextMenuSingleVideo)}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                Split by Scenes
+              </button>
+            ) : null}
+            {contextMenuSelectionVideos.length >= 1 ? (
               <button
                 type="button"
                 onMouseEnter={() => setContextSubmenu("extract-frames")}
@@ -1925,7 +2778,30 @@ function App() {
                 <span className="text-zinc-500">&gt;</span>
               </button>
             ) : null}
-            {contextMenuSelectionItems.length === 1 ? (
+            {contextMenuSelectionItems.length >= 1 || contextMenuFolderPath !== null ? (
+              <button
+                type="button"
+                onClick={applySearchQueryFromContext}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                {`Search (${Math.min(
+                  contextMenuSelectionItems.length || (contextMenuFolderPath !== null ? 1 : 0),
+                  10,
+                )})`}
+              </button>
+            ) : null}
+            {contextMenuSelectionItems.length >= 1 ? (
+              <button
+                type="button"
+                onClick={() => void handleResizeSelection()}
+                className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+              >
+                {contextMenuSelectionItems.length > 1
+                  ? `Resize Preset (${contextMenuSelectionItems.length})`
+                  : "Resize Preset"}
+              </button>
+            ) : null}
+            {contextMenuItem && contextMenuSelectionItems.length === 1 && !contextMenuItem.archivePath ? (
               <button
                 type="button"
                 onClick={() => {
@@ -1938,7 +2814,7 @@ function App() {
                 Duplicate
               </button>
             ) : null}
-            {contextMenuSelectionItems.length === 1 ? (
+            {contextMenuItem && contextMenuSelectionItems.length === 1 && !contextMenuItem.archivePath ? (
               <button
                 type="button"
                 onClick={() => {
@@ -1951,7 +2827,8 @@ function App() {
                 Rename
               </button>
             ) : null}
-            {contextMenuItem ? (
+            {contextMenuSelectionItems.length >= 1 &&
+            !contextMenuSelectionItems.some((item) => Boolean(item.archivePath)) ? (
               <button
                 type="button"
                 onClick={() => {
@@ -1961,8 +2838,13 @@ function App() {
                     void deleteSelectedItems();
                     return;
                   }
-                  setActiveId(contextMenuItem.id);
-                  void deleteItem(contextMenuItem);
+                  if (contextMenuItem) {
+                    setActiveId(contextMenuItem.id);
+                    void deleteItem(contextMenuItem);
+                  } else if (contextMenuSelectionItems[0]) {
+                    setActiveId(contextMenuSelectionItems[0].id);
+                    void deleteItem(contextMenuSelectionItems[0]);
+                  }
                 }}
                 className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] text-red-300 hover:bg-red-950/50"
               >
@@ -1973,7 +2855,7 @@ function App() {
             ) : null}
           </div>
 
-          {contextMenuItem?.kind === "image" && contextSubmenu === "background-remove" ? (
+          {contextMenuSelectionImages.length >= 1 && contextSubmenu === "background-remove" ? (
             <div
               className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
               style={{
@@ -1991,7 +2873,9 @@ function App() {
                   onClick={() =>
                     contextMenuSelectionItems.length > 1
                       ? void handleRemoveBackgroundSelected(engine.key)
-                      : void handleRemoveBackground(contextMenuItem, engine.key)
+                      : contextMenuSelectionImages[0]
+                        ? void handleRemoveBackground(contextMenuSelectionImages[0], engine.key)
+                        : undefined
                   }
                   disabled={contextMenuSelectionImages.length === 0}
                   className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
@@ -2001,7 +2885,7 @@ function App() {
               ))}
             </div>
           ) : null}
-          {contextMenuItem?.kind === "video" && contextSubmenu === "extract-frames" ? (
+          {contextMenuSelectionVideos.length >= 1 && contextSubmenu === "extract-frames" ? (
             <div
               className="fixed z-[41] min-w-56 rounded-xl border border-zinc-800 bg-[#121217] p-1.5 shadow-2xl"
               style={{
@@ -2019,7 +2903,9 @@ function App() {
                   onClick={() =>
                     contextMenuSelectionItems.length > 1
                       ? void handleExtractFramesSelected(preset.key)
-                      : void handleExtractFrames(contextMenuItem, preset.key)
+                      : contextMenuSelectionVideos[0]
+                        ? void handleExtractFrames(contextMenuSelectionVideos[0], preset.key)
+                        : undefined
                   }
                   disabled={contextMenuSelectionVideos.length === 0}
                   className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
@@ -2112,6 +2998,18 @@ function App() {
                 >
                   {animationPreviewLoop ? "Loop On" : "Loop Off"}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setAnimationPreviewReverse((prev) => !prev)}
+                  className={classNames(
+                    "rounded-lg border px-3 py-2 text-[12px]",
+                    animationPreviewReverse
+                      ? "border-amber-700 bg-amber-950/50 text-amber-200"
+                      : "border-zinc-800 bg-zinc-950 hover:bg-zinc-900",
+                  )}
+                >
+                  {animationPreviewReverse ? "Reverse On" : "Reverse Off"}
+                </button>
                 <div className="ml-2 flex min-w-[220px] items-center gap-3">
                   <span className="text-[11px] text-zinc-500">FPS</span>
                   <input
@@ -2132,7 +3030,7 @@ function App() {
                 </div>
               </div>
               <div className="mt-2 text-[11px] text-zinc-500">
-                Right-click the preview image to export as GIF or WebP.
+                Right-click the preview image to export as GIF, WebP, or APNG.
               </div>
             </div>
           </div>
@@ -2160,6 +3058,369 @@ function App() {
           >
             {animationExporting ? "Exporting..." : "Export as WebP"}
           </button>
+          <button
+            type="button"
+            onClick={() => void exportAnimationFromPreview("apng")}
+            disabled={animationExporting}
+            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900 disabled:cursor-wait disabled:opacity-60"
+          >
+            {animationExporting ? "Exporting..." : "Export as APNG"}
+          </button>
+        </div>
+      ) : null}
+
+      {actionDialog ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
+          <div className="w-full max-w-lg rounded-2xl border border-zinc-800 bg-[#121217] p-4 shadow-2xl">
+            <div className="text-[15px] font-semibold">{actionDialogTitle}</div>
+            <div className="mt-1 text-[12px] text-zinc-400">{actionDialogDescription}</div>
+
+            {actionDialog.kind === "bestCuts" ? (
+              <div className="mt-4 space-y-3">
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                    Best Cut Count
+                  </div>
+                  <input
+                    autoFocus
+                    value={actionDialog.count}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "bestCuts" ? { ...prev, count: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                </label>
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                    Scene Sensitivity
+                  </div>
+                  <input
+                    value={actionDialog.threshold}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "bestCuts" ? { ...prev, threshold: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                  <div className="mt-1 text-[11px] text-zinc-500">Recommended: `0.25` to `0.40`. Higher values create fewer cuts.</div>
+                </label>
+              </div>
+            ) : null}
+
+            {actionDialog.kind === "contactSheet" ? (
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Columns</div>
+                  <input
+                    autoFocus
+                    value={actionDialog.columns}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "contactSheet" ? { ...prev, columns: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                </label>
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Rows</div>
+                  <input
+                    value={actionDialog.rows}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "contactSheet" ? { ...prev, rows: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                </label>
+              </div>
+            ) : null}
+
+            {actionDialog.kind === "loopClip" ? (
+              <div className="mt-4 space-y-3">
+                <div className="overflow-hidden rounded-2xl border border-zinc-800 bg-black">
+                  <video
+                    ref={clipPreviewRef}
+                    src={actionDialog.item ? assetUrl(actionDialog.item.path) : ""}
+                    className="h-[280px] w-full object-contain"
+                    controls
+                    preload="metadata"
+                    muted={videoMuted}
+                    onLoadedMetadata={(event) => {
+                      const duration = event.currentTarget.duration || 0;
+                      setClipPreviewDuration(duration);
+                      setClipPreviewCurrentTime(event.currentTarget.currentTime || 0);
+                      setActionDialog((prev) =>
+                        prev?.kind === "loopClip"
+                          ? {
+                              ...prev,
+                              endSeconds:
+                                Number(prev.endSeconds) > 0
+                                  ? prev.endSeconds
+                                  : duration > 0
+                                    ? Math.min(duration, 2.5).toFixed(2)
+                                    : "2.5",
+                            }
+                          : prev,
+                      );
+                    }}
+                    onTimeUpdate={(event) => {
+                      setClipPreviewCurrentTime(event.currentTarget.currentTime || 0);
+                    }}
+                  />
+                  <div className="flex flex-wrap items-center gap-2 border-t border-zinc-800 bg-zinc-950/80 px-3 py-2 text-[11px] text-zinc-400">
+                    <span>Current: {formatSecondsLabel(clipPreviewCurrentTime)}</span>
+                    <span>Duration: {formatSecondsLabel(clipPreviewDuration)}</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setActionDialog((prev) =>
+                          prev?.kind === "loopClip"
+                            ? { ...prev, startSeconds: clipPreviewCurrentTime.toFixed(2) }
+                            : prev,
+                        )
+                      }
+                      className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-800"
+                    >
+                      Use Current as Start
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setActionDialog((prev) =>
+                          prev?.kind === "loopClip"
+                            ? { ...prev, endSeconds: clipPreviewCurrentTime.toFixed(2) }
+                            : prev,
+                        )
+                      }
+                      className="rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-800"
+                    >
+                      Use Current as End
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/40 p-3">
+                  <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                    <span>Start</span>
+                    <span>{formatSecondsLabel(clipDialogStartValue)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(clipPreviewDuration, 0.1)}
+                    step={0.1}
+                    value={clipDialogStartValue}
+                    onChange={(event) =>
+                      setActionDialog((prev) => {
+                        if (prev?.kind !== "loopClip") return prev;
+                        const nextStart = Number(event.target.value);
+                        const nextEnd = Math.max(nextStart, Number(prev.endSeconds) || nextStart);
+                        return {
+                          ...prev,
+                          startSeconds: nextStart.toFixed(2),
+                          endSeconds: nextEnd.toFixed(2),
+                        };
+                      })
+                    }
+                    className="w-full accent-white"
+                  />
+                  <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                    <span>End</span>
+                    <span>{formatSecondsLabel(clipDialogEndValue)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(clipPreviewDuration, 0.1)}
+                    step={0.1}
+                    value={clipDialogEndValue}
+                    onChange={(event) =>
+                      setActionDialog((prev) => {
+                        if (prev?.kind !== "loopClip") return prev;
+                        const nextEnd = Number(event.target.value);
+                        const nextStart = Math.min(Number(prev.startSeconds) || 0, nextEnd);
+                        return {
+                          ...prev,
+                          startSeconds: nextStart.toFixed(2),
+                          endSeconds: nextEnd.toFixed(2),
+                        };
+                      })
+                    }
+                    className="w-full accent-white"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Start Time</div>
+                    <input
+                      value={actionDialog.startSeconds}
+                      onChange={(event) =>
+                        setActionDialog((prev) =>
+                          prev?.kind === "loopClip" ? { ...prev, startSeconds: event.target.value } : prev,
+                        )
+                      }
+                      className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                    />
+                  </label>
+                  <label className="block">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">End Time</div>
+                    <input
+                      value={actionDialog.endSeconds}
+                      onChange={(event) =>
+                        setActionDialog((prev) =>
+                          prev?.kind === "loopClip" ? { ...prev, endSeconds: event.target.value } : prev,
+                        )
+                      }
+                      className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                    />
+                  </label>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Format</div>
+                    <select
+                      value={actionDialog.format}
+                      onChange={(event) =>
+                        setActionDialog((prev) =>
+                          prev?.kind === "loopClip"
+                            ? { ...prev, format: event.target.value as LoopExportFormat }
+                            : prev,
+                        )
+                      }
+                      className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                    >
+                      <option value="mp4">MP4</option>
+                      <option value="gif">GIF</option>
+                      <option value="webp">Animated WebP</option>
+                    </select>
+                  </label>
+                  <label className="block">
+                    <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">FPS</div>
+                    <select
+                      value={actionDialog.fps}
+                      onChange={(event) =>
+                        setActionDialog((prev) =>
+                          prev?.kind === "loopClip" ? { ...prev, fps: event.target.value } : prev,
+                        )
+                      }
+                      className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                    >
+                      <option value="8">8 FPS</option>
+                      <option value="12">12 FPS</option>
+                      <option value="15">15 FPS</option>
+                      <option value="24">24 FPS</option>
+                      <option value="30">30 FPS</option>
+                      <option value="60">60 FPS</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-[12px] text-zinc-300">
+                  Output: save the selected range as {actionDialog.format.toUpperCase()} using {actionDialog.fps} FPS.
+                </div>
+              </div>
+            ) : null}
+
+            {actionDialog.kind === "splitScenes" ? (
+              <div className="mt-4 space-y-3">
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Scene Sensitivity</div>
+                  <input
+                    autoFocus
+                    value={actionDialog.threshold}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "splitScenes" ? { ...prev, threshold: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                </label>
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Minimum Scene Length</div>
+                  <input
+                    value={actionDialog.minSceneSeconds}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "splitScenes" ? { ...prev, minSceneSeconds: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                </label>
+              </div>
+            ) : null}
+
+            {actionDialog.kind === "portfolioSheet" ? (
+              <div className="mt-4 space-y-3">
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-[12px] text-zinc-300">
+                  {actionDialog.imageCount} selected images will be placed on one JPG sheet.
+                </div>
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Columns</div>
+                  <input
+                    autoFocus
+                    value={actionDialog.columns}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "portfolioSheet" ? { ...prev, columns: event.target.value } : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  />
+                </label>
+              </div>
+            ) : null}
+
+            {actionDialog.kind === "resizePreset" ? (
+              <div className="mt-4 space-y-3">
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-[12px] text-zinc-300">
+                  Apply one output size to {actionDialog.itemCount} selected item(s). Target kinds: {actionDialog.targetKinds}.
+                </div>
+                <label className="block">
+                  <div className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Preset</div>
+                  <select
+                    autoFocus
+                    value={actionDialog.presetKey}
+                    onChange={(event) =>
+                      setActionDialog((prev) =>
+                        prev?.kind === "resizePreset"
+                          ? { ...prev, presetKey: event.target.value as ResizePresetKey }
+                          : prev,
+                      )
+                    }
+                    className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
+                  >
+                    <option value="square_1080">Square 1080x1080</option>
+                    <option value="story_1080x1920">Story 1080x1920</option>
+                    <option value="landscape_1920x1080">Landscape 1920x1080</option>
+                    <option value="thumb_1280x720">Thumbnail 1280x720</option>
+                  </select>
+                </label>
+              </div>
+            ) : null}
+
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setActionDialog(null)}
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[12px] hover:bg-zinc-900"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void submitActionDialog()}
+                disabled={isSaving}
+                className="rounded-lg bg-white px-3 py-2 text-[12px] font-semibold text-zinc-950 disabled:cursor-wait disabled:opacity-60"
+              >
+                {isSaving ? "Working..." : "Run"}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -2226,7 +3487,13 @@ function App() {
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
                   Type
                 </div>
-                <div className="mt-1">{active.kind === "video" ? "Video" : "Image"}</div>
+                <div className="mt-1">
+                  {active.kind === "video"
+                    ? "Video"
+                    : active.kind === "zip"
+                      ? "ZIP Archive"
+                      : "Image"}
+                </div>
               </div>
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
@@ -2250,7 +3517,69 @@ function App() {
                 <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
                   Full Path
                 </div>
-                <div className="mt-1 break-words">{active.path}</div>
+                <div className="mt-1 break-words">{activeFullPath}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {aboutOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
+          <div className="w-full max-w-lg rounded-2xl border border-zinc-800 bg-[#121217] p-4 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[15px] font-semibold">About MViewer</div>
+                <div className="mt-1 text-[11px] text-zinc-500">Desktop media viewer for local images, videos, and archives.</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAboutOpen(false)}
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[12px] hover:bg-zinc-900"
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-4 space-y-3 rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3 text-[12px] text-zinc-300">
+              <div>MViewer is focused on quick browsing, previewing, and lightweight utility actions for local media.</div>
+              <div className="text-zinc-500">Current flow: folder browsing, image/video preview, ZIP browsing, background tasks, and utility exports.</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {manualOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
+          <div className="w-full max-w-2xl rounded-2xl border border-zinc-800 bg-[#121217] p-4 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[15px] font-semibold">Manual</div>
+                <div className="mt-1 text-[11px] text-zinc-500">Quick guide for the current desktop workflow.</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setManualOpen(false)}
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[12px] hover:bg-zinc-900"
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-4 grid gap-3 md:grid-cols-2">
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">Browse</div>
+                <div className="mt-2 text-[12px] text-zinc-300">Choose a folder, browse the explorer, and click files to preview them.</div>
+              </div>
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">Preview</div>
+                <div className="mt-2 text-[12px] text-zinc-300">Keep `Preview` on to inspect the current file. Turn it off for a simpler browsing layout.</div>
+              </div>
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">Context Menu</div>
+                <div className="mt-2 text-[12px] text-zinc-300">Right-click files or folders to run export, extraction, and utility actions.</div>
+              </div>
+              <div className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-500">Tasks</div>
+                <div className="mt-2 text-[12px] text-zinc-300">Long-running jobs appear in the background task panel at the bottom-right.</div>
               </div>
             </div>
           </div>
@@ -2368,8 +3697,12 @@ function App() {
                         transitionDuration: isDraggingImage ? "0ms" : "140ms",
                       }}
                     />
-                  ) : (
+                  ) : active.kind === "video" ? (
                     renderVideoPreview("bg-black")
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center rounded-2xl bg-zinc-950 text-center text-sm text-zinc-400">
+                      ZIP archive preview is not available yet.
+                    </div>
                   )}
                 </div>
                 <button
@@ -2398,4 +3731,7 @@ function App() {
 }
 
 export default App;
+
+
+
 

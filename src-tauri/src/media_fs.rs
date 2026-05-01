@@ -10,6 +10,7 @@ pub fn media_kind_for_extension(ext: &str) -> Option<&'static str> {
     match ext {
         ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".svg" | ".avif" => Some("image"),
         ".mp4" | ".mov" | ".m4v" | ".webm" | ".mkv" | ".avi" | ".wmv" => Some("video"),
+        ".zip" => Some("zip"),
         _ => None,
     }
 }
@@ -36,6 +37,31 @@ pub fn modified_ms(metadata: &std::fs::Metadata) -> u128 {
 
 pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+fn build_media_item(
+    kind: &str,
+    name: String,
+    path: String,
+    archive_path: Option<String>,
+    archive_entry_path: Option<String>,
+    relative_path: String,
+    ext: String,
+    size_bytes: u64,
+    modified_ms: u128,
+) -> MediaItem {
+    MediaItem {
+        id: format!("{}-{}", relative_path, modified_ms),
+        kind: kind.to_string(),
+        name,
+        path,
+        archive_path,
+        archive_entry_path,
+        relative_path,
+        ext,
+        size_bytes,
+        modified_ms,
+    }
 }
 
 pub fn is_remove_bg_supported_image(path: &Path) -> bool {
@@ -189,7 +215,7 @@ fn archive_cache_dir(source: &Path) -> Result<PathBuf, String> {
     modified.hash(&mut hasher);
     let cache_key = format!("{:016x}", hasher.finish());
     Ok(std::env::temp_dir()
-        .join("media-vault-archive-cache")
+        .join("mviewer-archive-cache")
         .join(cache_key))
 }
 
@@ -284,16 +310,17 @@ pub fn scan_folder(root: &Path) -> Result<ScanResult, String> {
             .unwrap_or_default()
             .to_string();
 
-        items.push(MediaItem {
-            id: format!("{}-{}", relative_path, modified),
-            kind: kind.to_string(),
+        items.push(build_media_item(
+            kind,
             name,
-            path: path.to_string_lossy().to_string(),
+            path.to_string_lossy().to_string(),
+            None,
+            None,
             relative_path,
             ext,
-            size_bytes: metadata.len(),
-            modified_ms: modified,
-        });
+            metadata.len(),
+            modified,
+        ));
     }
 
     items.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
@@ -385,7 +412,10 @@ pub fn duplicate_media_file(file_path: String) -> Result<String, String> {
     Ok(target.to_string_lossy().to_string())
 }
 
-pub fn create_media_folder(root_path: String, relative_folder_path: String) -> Result<String, String> {
+pub fn create_media_folder(
+    root_path: String,
+    relative_folder_path: String,
+) -> Result<String, String> {
     let parent = resolve_folder_path(&root_path, &relative_folder_path);
     if !parent.exists() {
         return Err("Selected folder no longer exists.".to_string());

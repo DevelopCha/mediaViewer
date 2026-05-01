@@ -65,8 +65,13 @@ export function deleteMediaFolder(rootPath: string, relativeFolderPath: string) 
 export function enqueueRemoveImageBackground(
   filePath: string,
   engineKey: BackgroundEngineKey,
+  preferredOutputRoot?: string | null,
 ) {
-  return invoke<BackgroundTask>("enqueue_remove_image_background", { filePath, engineKey });
+  return invoke<BackgroundTask>("enqueue_remove_image_background", {
+    filePath,
+    engineKey,
+    preferredOutputRoot,
+  });
 }
 
 export function enqueueExtractVideoFrames(
@@ -74,12 +79,14 @@ export function enqueueExtractVideoFrames(
   presetKey: FrameExtractPresetKey,
   eyeMode: VideoEyeMode,
   layout: VideoVrLayout,
+  preferredOutputRoot?: string | null,
 ) {
   return invoke<BackgroundTask>("enqueue_extract_video_frames", {
     filePath,
     presetKey,
     eyeMode,
     layout,
+    preferredOutputRoot,
   });
 }
 
@@ -95,10 +102,98 @@ export function exportImageSequenceAnimation(
   imagePaths: string[],
   format: AnimationExportFormat,
   fps: number,
+  reverse: boolean,
+  preferredOutputRoot?: string | null,
 ) {
   return invoke<string>("export_image_sequence_animation", {
     imagePaths,
     format,
     fps,
+    reverse,
+    preferredOutputRoot,
+  });
+}
+
+export function exportVideoBestCuts(
+  filePath: string,
+  count: number,
+  threshold: number,
+  preferredOutputRoot?: string | null,
+) {
+  return invoke<string>("export_video_best_cuts", {
+    filePath,
+    count,
+    threshold,
+    preferredOutputRoot,
+  });
+}
+
+export function exportVideoContactSheet(
+  filePath: string,
+  columns: number,
+  rows: number,
+  preferredOutputRoot?: string | null,
+) {
+  return invoke<string>("export_video_contact_sheet", {
+    filePath,
+    columns,
+    rows,
+    preferredOutputRoot,
+  });
+}
+
+export function exportVideoLoopClip(
+  filePath: string,
+  startSeconds: number,
+  durationSeconds: number,
+  format: "mp4" | "gif" | "webp",
+  fps: number,
+  preferredOutputRoot?: string | null,
+) {
+  return invoke<string>("export_video_loop_clip", {
+    filePath,
+    startSeconds,
+    durationSeconds,
+    format,
+    fps,
+    preferredOutputRoot,
+  });
+}
+
+export function splitVideoByScenes(
+  filePath: string,
+  threshold: number,
+  minSceneSeconds: number,
+  preferredOutputRoot?: string | null,
+) {
+  return invoke<string>("split_video_by_scenes", {
+    filePath,
+    threshold,
+    minSceneSeconds,
+    preferredOutputRoot,
+  });
+}
+
+export function exportPortfolioSheet(
+  imagePaths: string[],
+  columns: number,
+  preferredOutputRoot?: string | null,
+) {
+  return invoke<string>("export_portfolio_sheet", {
+    imagePaths,
+    columns,
+    preferredOutputRoot,
+  });
+}
+
+export function resizeMediaFileWithPreset(
+  filePath: string,
+  presetKey: string,
+  preferredOutputRoot?: string | null,
+) {
+  return invoke<string>("resize_media_file_with_preset", {
+    filePath,
+    presetKey,
+    preferredOutputRoot,
   });
 }

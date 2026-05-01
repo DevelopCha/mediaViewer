@@ -1,7 +1,7 @@
 [package]
 name = "tauri-app"
 version = "0.1.0"
-description = "Media Vault desktop app for browsing and managing local images and videos."
+description = "MViewer media viewer desktop app for browsing local images and videos."
 authors = ["tallicha"]
 edition = "2021"
 
@@ -25,3 +25,4 @@ serde_json = "1"
 walkdir = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }

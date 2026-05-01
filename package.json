@@ -2,7 +2,7 @@
   "name": "tauri-app",
   "private": true,
   "version": "0.1.0",
-  "description": "Media Vault desktop app built with Tauri, React, and TypeScript.",
+  "description": "MViewer media viewer desktop app built with Tauri, React, and TypeScript.",
   "type": "module",
   "scripts": {
     "dev": "vite",

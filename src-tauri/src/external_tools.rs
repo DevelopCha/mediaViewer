@@ -1,8 +1,12 @@
 use crate::media_fs::{
     common_parent_dir, extract_frames_output_dir, large_media_warning, remove_bg_output_path,
-    unique_output_file,
+    unique_named_path, unique_output_file,
 };
 use crate::models::now_ms;
+use image::{
+    imageops::{overlay, FilterType},
+    DynamicImage, ImageBuffer, Rgba, RgbaImage,
+};
 use std::fs;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -13,6 +17,8 @@ use tauri::{AppHandle, Manager};
 const BUNDLED_VENV_DIR: &str = ".rembg-venv";
 const BUNDLED_SCRIPTS_DIR: &str = "scripts";
 const BUNDLED_TOOLS_DIR: &str = "resources/tools";
+const CONTACT_SHEET_TILE_WIDTH: u32 = 360;
+const PORTFOLIO_TILE_WIDTH: u32 = 420;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -261,7 +267,9 @@ fn remove_background_script_path(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(script_path);
     }
 
-    let script_path = manifest_dir().join(BUNDLED_SCRIPTS_DIR).join("remove_background.py");
+    let script_path = manifest_dir()
+        .join(BUNDLED_SCRIPTS_DIR)
+        .join("remove_background.py");
     if script_path.exists() {
         Ok(script_path)
     } else {
@@ -281,8 +289,196 @@ pub fn build_remove_bg_output_path(source: &Path) -> Result<PathBuf, String> {
     remove_bg_output_path(source)
 }
 
+pub fn build_remove_bg_output_path_in(parent: &Path, source_name: &str) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    let folder_prefix = format!("rmbg_{}", chrono::Local::now().format("%Y%m%d"));
+    let output_dir = unique_named_path(parent, &folder_prefix, None);
+    Ok(output_dir.join(format!("{stem}_rmbg.png")))
+}
+
 pub fn build_extract_frames_output_dir(source: &Path) -> Result<PathBuf, String> {
     extract_frames_output_dir(source)
+}
+
+pub fn build_extract_frames_output_dir_in(
+    parent: &Path,
+    source_name: &str,
+) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    Ok(unique_named_path(parent, stem, None))
+}
+
+pub fn build_best_cuts_output_dir(source: &Path) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+
+    Ok(unique_named_path(parent, &format!("{stem}_bestcuts"), None))
+}
+
+pub fn build_best_cuts_output_dir_in(parent: &Path, source_name: &str) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    Ok(unique_named_path(parent, &format!("{stem}_bestcuts"), None))
+}
+
+pub fn build_scene_split_output_dir(source: &Path) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+
+    Ok(unique_named_path(parent, &format!("{stem}_scenes"), None))
+}
+
+pub fn build_scene_split_output_dir_in(
+    parent: &Path,
+    source_name: &str,
+) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    Ok(unique_named_path(parent, &format!("{stem}_scenes"), None))
+}
+
+pub fn build_video_contact_sheet_output_path(source: &Path) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+
+    Ok(unique_output_file(
+        parent,
+        &format!("{stem}_contact_sheet"),
+        "jpg",
+    ))
+}
+
+pub fn build_video_contact_sheet_output_path_in(
+    parent: &Path,
+    source_name: &str,
+) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    Ok(unique_output_file(
+        parent,
+        &format!("{stem}_contact_sheet"),
+        "jpg",
+    ))
+}
+
+pub fn build_loop_clip_output_path(source: &Path, format: &str) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+
+    Ok(unique_output_file(parent, &format!("{stem}_loop"), format))
+}
+
+pub fn build_loop_clip_output_path_in(
+    parent: &Path,
+    source_name: &str,
+    format: &str,
+) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    Ok(unique_output_file(parent, &format!("{stem}_clip"), format))
+}
+
+pub fn build_resized_output_path(
+    source: &Path,
+    suffix: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    let parent = source
+        .parent()
+        .ok_or_else(|| "Could not resolve the parent folder.".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+
+    Ok(unique_output_file(
+        parent,
+        &format!("{stem}_{suffix}"),
+        extension,
+    ))
+}
+
+pub fn build_resized_output_path_in(
+    parent: &Path,
+    source_name: &str,
+    suffix: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Could not resolve the file name.".to_string())?;
+    Ok(unique_output_file(
+        parent,
+        &format!("{stem}_{suffix}"),
+        extension,
+    ))
+}
+
+pub fn build_portfolio_sheet_output_path(image_paths: &[PathBuf]) -> Result<PathBuf, String> {
+    let parent = common_parent_dir(image_paths)
+        .or_else(|| {
+            image_paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(Path::to_path_buf)
+        })
+        .ok_or_else(|| "Could not resolve the output folder.".to_string())?;
+    let base_name = parent
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("portfolio");
+    Ok(unique_output_file(
+        &parent,
+        &format!("{base_name}_portfolio"),
+        "jpg",
+    ))
+}
+
+pub fn build_portfolio_sheet_output_path_in(
+    parent: &Path,
+    base_name: &str,
+) -> Result<PathBuf, String> {
+    Ok(unique_output_file(
+        parent,
+        &format!("{base_name}_portfolio"),
+        "jpg",
+    ))
 }
 
 pub fn perform_background_removal_with_engine(
@@ -365,6 +561,34 @@ pub fn detect_ffmpeg_binary(app: &AppHandle, name: &str) -> Result<String, Strin
     }
 }
 
+fn run_command_capture(
+    program: &str,
+    args: &[String],
+    working_dir: &Path,
+) -> Result<(String, String), String> {
+    let output = silent_command(program)
+        .args(args)
+        .current_dir(working_dir)
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok((stdout, stderr))
+    } else {
+        let details = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("Command failed with status {}.", output.status)
+        };
+        Err(details)
+    }
+}
+
 fn video_duration_seconds(app: &AppHandle, source: &Path) -> Result<f64, String> {
     let ffprobe = detect_ffmpeg_binary(app, "ffprobe")?;
     let args = vec![
@@ -390,6 +614,75 @@ fn video_duration_seconds(app: &AppHandle, source: &Path) -> Result<f64, String>
     value
         .parse::<f64>()
         .map_err(|_| "Failed to read the video duration.".to_string())
+}
+
+fn video_duration_seconds_from_ffmpeg(ffmpeg_output: &str) -> Vec<f64> {
+    let mut timestamps = Vec::new();
+    for line in ffmpeg_output.lines() {
+        let Some(index) = line.find("pts_time:") else {
+            continue;
+        };
+        let value = &line[index + "pts_time:".len()..];
+        let end = value
+            .find(char::is_whitespace)
+            .map(|inner_index| &value[..inner_index])
+            .unwrap_or(value);
+        if let Ok(parsed) = end.parse::<f64>() {
+            timestamps.push(parsed);
+        }
+    }
+    timestamps
+}
+
+fn dedupe_timestamps(values: Vec<f64>, min_gap: f64) -> Vec<f64> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if deduped
+            .last()
+            .is_none_or(|previous: &f64| (value - previous).abs() >= min_gap)
+        {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
+fn fallback_even_timestamps(duration_seconds: f64, count: usize) -> Vec<f64> {
+    if count == 0 || duration_seconds <= 0.0 {
+        return Vec::new();
+    }
+
+    let step = duration_seconds / (count as f64 + 1.0);
+    (0..count)
+        .map(|index| step * (index as f64 + 1.0))
+        .collect()
+}
+
+fn scene_change_timestamps(
+    app: &AppHandle,
+    source: &Path,
+    threshold: f64,
+) -> Result<Vec<f64>, String> {
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let runtime_dir = runtime_base_dir(app);
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-i".to_string(),
+        source.to_string_lossy().to_string(),
+        "-vf".to_string(),
+        format!("select='gt(scene,{threshold})',showinfo"),
+        "-an".to_string(),
+        "-f".to_string(),
+        "null".to_string(),
+        "-".to_string(),
+    ];
+
+    let (_, stderr) = run_command_capture(&ffmpeg, &args, &runtime_dir)
+        .map_err(|error| format!("Scene analysis failed. {error}"))?;
+    Ok(dedupe_timestamps(
+        video_duration_seconds_from_ffmpeg(&stderr),
+        0.15,
+    ))
 }
 
 fn frame_extraction_filter(preset_key: &str, duration_seconds: f64) -> Result<String, String> {
@@ -499,30 +792,47 @@ pub fn export_animation_from_images(
     image_paths: &[String],
     format: &str,
     fps: u32,
+    reverse: bool,
+    preferred_output_root: Option<&Path>,
 ) -> Result<String, String> {
     if image_paths.len() < 2 {
         return Err("Select at least two images to export an animation.".to_string());
     }
 
-    if !matches!(format, "gif" | "webp") {
+    if !matches!(format, "gif" | "webp" | "apng") {
         return Err("Unsupported animation format.".to_string());
     }
 
     let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
-    let paths: Vec<PathBuf> = image_paths.iter().map(PathBuf::from).collect();
-    let parent_dir = common_parent_dir(&paths)
+    let mut paths: Vec<PathBuf> = image_paths.iter().map(PathBuf::from).collect();
+    if reverse {
+        paths.reverse();
+    }
+    let parent_dir = preferred_output_root
+        .map(Path::to_path_buf)
         .or_else(|| {
-            paths
-                .first()
-                .and_then(|path| path.parent())
-                .map(Path::to_path_buf)
+            common_parent_dir(&paths).or_else(|| {
+                paths
+                    .first()
+                    .and_then(|path| path.parent())
+                    .map(Path::to_path_buf)
+            })
         })
         .ok_or_else(|| "Could not resolve the output folder.".to_string())?;
-    let base_name = parent_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("animation");
+    let base_name = if preferred_output_root.is_some() {
+        paths
+            .first()
+            .and_then(|path| path.file_stem())
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("animation")
+    } else {
+        parent_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("animation")
+    };
     let output_path = unique_output_file(&parent_dir, base_name, format);
     let frame_duration = 1.0 / fps.max(1) as f64;
 
@@ -543,7 +853,7 @@ pub fn export_animation_from_images(
         list_content.push_str(&format!("file '{}'\n", safe_path));
     }
 
-    let list_path = std::env::temp_dir().join(format!("media-vault-animation-{}.txt", now_ms()));
+    let list_path = std::env::temp_dir().join(format!("mviewer-animation-{}.txt", now_ms()));
     fs::write(&list_path, list_content).map_err(|error| error.to_string())?;
 
     let result = (|| {
@@ -565,6 +875,14 @@ pub fn export_animation_from_images(
                 format!("fps={fps},split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"),
                 "-loop".to_string(),
                 "0".to_string(),
+                output_path.to_string_lossy().to_string(),
+            ]);
+        } else if format == "apng" {
+            args.extend([
+                "-plays".to_string(),
+                "0".to_string(),
+                "-f".to_string(),
+                "apng".to_string(),
                 output_path.to_string_lossy().to_string(),
             ]);
         } else {
@@ -590,4 +908,359 @@ pub fn export_animation_from_images(
     result
         .map(|_| output_path.to_string_lossy().to_string())
         .map_err(|error| format!("Animation export failed. {error}"))
+}
+
+fn extract_frame_at_timestamp(
+    ffmpeg: &str,
+    source: &Path,
+    output_path: &Path,
+    timestamp_seconds: f64,
+) -> Result<(), String> {
+    let working_dir = output_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        format!("{timestamp_seconds:.3}"),
+        "-i".to_string(),
+        source.to_string_lossy().to_string(),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        "-q:v".to_string(),
+        "2".to_string(),
+        output_path.to_string_lossy().to_string(),
+    ];
+    run_command_without_capture(ffmpeg, &args, &working_dir)
+}
+
+pub fn export_video_best_cuts(
+    app: &AppHandle,
+    file_path: &str,
+    output_dir: &str,
+    count: usize,
+    threshold: f64,
+) -> Result<(), String> {
+    let source = PathBuf::from(file_path);
+    let output = PathBuf::from(output_dir);
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let duration_seconds = video_duration_seconds(app, &source)?;
+    let mut timestamps = scene_change_timestamps(app, &source, threshold)?;
+
+    if timestamps.len() > count {
+        let step = timestamps.len() as f64 / count as f64;
+        timestamps = (0..count)
+            .filter_map(|index| {
+                timestamps
+                    .get((index as f64 * step).floor() as usize)
+                    .copied()
+            })
+            .collect();
+    }
+
+    if timestamps.is_empty() {
+        timestamps = fallback_even_timestamps(duration_seconds, count.max(1));
+    }
+
+    fs::create_dir_all(&output).map_err(|error| error.to_string())?;
+    for (index, timestamp) in timestamps.iter().enumerate() {
+        let output_file = output.join(format!("bestcut_{:03}.jpg", index + 1));
+        extract_frame_at_timestamp(&ffmpeg, &source, &output_file, *timestamp)
+            .map_err(|error| format!("Best-cut extraction failed. {error}"))?;
+    }
+
+    Ok(())
+}
+
+pub fn export_video_contact_sheet(
+    app: &AppHandle,
+    file_path: &str,
+    output_path: &str,
+    columns: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let source = PathBuf::from(file_path);
+    let output = PathBuf::from(output_path);
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let duration_seconds = video_duration_seconds(app, &source)?;
+    let frame_count = (columns.max(1) * rows.max(1)).max(1);
+    let fps = (frame_count as f64 / duration_seconds.max(1.0)).max(0.01);
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        source.to_string_lossy().to_string(),
+        "-vf".to_string(),
+        format!(
+            "fps={fps:.6},scale={}:-1:force_original_aspect_ratio=decrease,tile={}x{}",
+            CONTACT_SHEET_TILE_WIDTH, columns, rows
+        ),
+        "-frames:v".to_string(),
+        "1".to_string(),
+        output.to_string_lossy().to_string(),
+    ];
+
+    let working_dir = output
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    run_command_without_capture(&ffmpeg, &args, &working_dir)
+        .map_err(|error| format!("Contact sheet export failed. {error}"))
+}
+
+pub fn export_video_loop_clip(
+    app: &AppHandle,
+    file_path: &str,
+    output_path: &str,
+    start_seconds: f64,
+    duration_seconds: f64,
+    format: &str,
+    fps: u32,
+) -> Result<(), String> {
+    let source = PathBuf::from(file_path);
+    let output = PathBuf::from(output_path);
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let safe_duration = duration_seconds.max(0.2);
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        format!("{:.3}", start_seconds.max(0.0)),
+        "-t".to_string(),
+        format!("{safe_duration:.3}"),
+        "-i".to_string(),
+        source.to_string_lossy().to_string(),
+    ];
+
+    match format {
+        "mp4" => args.extend([
+            "-vf".to_string(),
+            format!("fps={}", fps.max(1)),
+            "-an".to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+        ]),
+        "gif" => args.extend([
+            "-filter_complex".to_string(),
+            format!(
+                "fps={},scale=720:-1:force_original_aspect_ratio=decrease,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                fps.max(1)
+            ),
+            "-loop".to_string(),
+            "0".to_string(),
+        ]),
+        "webp" => args.extend([
+            "-vf".to_string(),
+            format!(
+                "fps={},scale=720:-1:force_original_aspect_ratio=decrease",
+                fps.max(1)
+            ),
+            "-loop".to_string(),
+            "0".to_string(),
+            "-c:v".to_string(),
+            "libwebp_anim".to_string(),
+            "-quality".to_string(),
+            "90".to_string(),
+        ]),
+        _ => return Err("Unsupported loop export format.".to_string()),
+    }
+    args.push(output.to_string_lossy().to_string());
+
+    let working_dir = output
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    run_command_without_capture(&ffmpeg, &args, &working_dir)
+        .map_err(|error| format!("Loop clip export failed. {error}"))
+}
+
+pub fn split_video_into_scenes(
+    app: &AppHandle,
+    file_path: &str,
+    output_dir: &str,
+    threshold: f64,
+    min_scene_seconds: f64,
+) -> Result<(), String> {
+    let source = PathBuf::from(file_path);
+    let output = PathBuf::from(output_dir);
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let duration_seconds = video_duration_seconds(app, &source)?;
+    let mut markers = scene_change_timestamps(app, &source, threshold)?;
+    markers.retain(|value| *value > 0.0 && *value < duration_seconds);
+
+    let mut bounds = Vec::with_capacity(markers.len() + 2);
+    bounds.push(0.0);
+    bounds.extend(markers);
+    bounds.push(duration_seconds);
+
+    fs::create_dir_all(&output).map_err(|error| error.to_string())?;
+
+    let mut exported = 0usize;
+    for window in bounds.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        let scene_duration = end - start;
+        if scene_duration < min_scene_seconds {
+            continue;
+        }
+
+        let output_file = output.join(format!("scene_{:03}.mp4", exported + 1));
+        let args = vec![
+            "-hide_banner".to_string(),
+            "-loglevel".to_string(),
+            "error".to_string(),
+            "-ss".to_string(),
+            format!("{start:.3}"),
+            "-t".to_string(),
+            format!("{scene_duration:.3}"),
+            "-i".to_string(),
+            source.to_string_lossy().to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            "veryfast".to_string(),
+            "-crf".to_string(),
+            "20".to_string(),
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            output_file.to_string_lossy().to_string(),
+        ];
+        run_command_without_capture(&ffmpeg, &args, &output)
+            .map_err(|error| format!("Scene split failed. {error}"))?;
+        exported += 1;
+    }
+
+    if exported == 0 {
+        return Err("No scene boundaries were found with the current threshold.".to_string());
+    }
+
+    Ok(())
+}
+
+fn resize_for_canvas(image: DynamicImage, max_width: u32) -> DynamicImage {
+    if image.width() <= max_width {
+        image
+    } else {
+        image.resize(max_width, u32::MAX, FilterType::Lanczos3)
+    }
+}
+
+pub fn export_portfolio_sheet(
+    image_paths: &[String],
+    output_path: &str,
+    columns: u32,
+) -> Result<(), String> {
+    if image_paths.len() < 2 {
+        return Err("Select at least two images to create a portfolio sheet.".to_string());
+    }
+
+    let columns = columns.max(1);
+    let rows = ((image_paths.len() as f32) / columns as f32).ceil() as u32;
+    let gap = 24u32;
+    let margin = 32u32;
+
+    let mut thumbnails = Vec::new();
+    let mut max_tile_height = 0u32;
+    for path in image_paths {
+        let image = image::open(path).map_err(|error| format!("Failed to open image. {error}"))?;
+        let resized = resize_for_canvas(image, PORTFOLIO_TILE_WIDTH);
+        max_tile_height = max_tile_height.max(resized.height());
+        thumbnails.push(resized.to_rgba8());
+    }
+
+    let canvas_width = margin * 2 + columns * PORTFOLIO_TILE_WIDTH + (columns - 1) * gap;
+    let canvas_height = margin * 2 + rows * max_tile_height + (rows - 1) * gap;
+    let mut canvas: RgbaImage =
+        ImageBuffer::from_pixel(canvas_width, canvas_height, Rgba([245, 245, 245, 255]));
+
+    for (index, thumbnail) in thumbnails.iter().enumerate() {
+        let column = index as u32 % columns;
+        let row = index as u32 / columns;
+        let x = margin + column * (PORTFOLIO_TILE_WIDTH + gap);
+        let y = margin + row * (max_tile_height + gap);
+        overlay(&mut canvas, thumbnail, x.into(), y.into());
+    }
+
+    DynamicImage::ImageRgba8(canvas)
+        .save(output_path)
+        .map_err(|error| format!("Failed to save the portfolio sheet. {error}"))
+}
+
+fn resize_dimensions_for_preset(preset_key: &str) -> Result<(u32, u32), String> {
+    match preset_key {
+        "square_1080" => Ok((1080, 1080)),
+        "story_1080x1920" => Ok((1080, 1920)),
+        "landscape_1920x1080" => Ok((1920, 1080)),
+        "thumb_1280x720" => Ok((1280, 720)),
+        _ => Err("Unknown resize preset.".to_string()),
+    }
+}
+
+pub fn resize_media_with_preset(
+    app: &AppHandle,
+    file_path: &str,
+    output_path: &str,
+    preset_key: &str,
+) -> Result<(), String> {
+    let source = PathBuf::from(file_path);
+    let output = PathBuf::from(output_path);
+    let ffmpeg = detect_ffmpeg_binary(app, "ffmpeg")?;
+    let (width, height) = resize_dimensions_for_preset(preset_key)?;
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    let scale_filter = format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+    );
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-i".to_string(),
+        source.to_string_lossy().to_string(),
+    ];
+
+    if matches!(
+        extension.as_str(),
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "wmv"
+    ) {
+        args.extend([
+            "-vf".to_string(),
+            scale_filter,
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            "veryfast".to_string(),
+            "-crf".to_string(),
+            "20".to_string(),
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+        ]);
+    } else {
+        args.extend(["-vf".to_string(), scale_filter]);
+    }
+    args.push(output.to_string_lossy().to_string());
+
+    let working_dir = output
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    run_command_without_capture(&ffmpeg, &args, &working_dir)
+        .map_err(|error| format!("Resize export failed. {error}"))
 }

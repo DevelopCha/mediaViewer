@@ -1,16 +1,16 @@
-@echo off
+﻿@echo off
 setlocal
 cd /d "%~dp0"
 
 set "APP_EXE=src-tauri\target\release\tauri-app.exe"
 
 if not exist "%APP_EXE%" (
-  echo [Media Vault] 릴리스 EXE가 없습니다.
-  echo 먼저 build-release.bat 또는 npm run build:desktop 을 실행하세요.
+  echo [MViewer] 由대━??EXE媛 ?놁뒿?덈떎.
+  echo 癒쇱? build-release.bat ?먮뒗 npm run build:desktop ???ㅽ뻾?섏꽭??
   exit /b 1
 )
 
-echo [Media Vault] 릴리스 EXE를 실행합니다...
+echo [MViewer] 由대━??EXE瑜??ㅽ뻾?⑸땲??..
 start "" "%APP_EXE%"
 
 endlocal

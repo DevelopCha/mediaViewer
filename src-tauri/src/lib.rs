@@ -3,25 +3,53 @@ mod external_tools;
 mod media_fs;
 mod models;
 
-use background::{clear_finished_tasks, cancel_task, enqueue_task, BackgroundRemovalQueue, BackgroundRemovalState, BackgroundTaskDraft};
+use background::{
+    cancel_task, clear_finished_tasks, enqueue_task, BackgroundRemovalQueue,
+    BackgroundRemovalState, BackgroundTaskDraft,
+};
 use external_tools::{
-    build_extract_frames_output_dir, build_remove_bg_output_path, detect_ffmpeg_binary,
-    export_animation_from_images, frame_extraction_warning, remove_background_warning,
+    build_best_cuts_output_dir, build_best_cuts_output_dir_in, build_extract_frames_output_dir,
+    build_extract_frames_output_dir_in, build_loop_clip_output_path,
+    build_loop_clip_output_path_in, build_portfolio_sheet_output_path,
+    build_portfolio_sheet_output_path_in, build_remove_bg_output_path,
+    build_remove_bg_output_path_in, build_resized_output_path, build_resized_output_path_in,
+    build_scene_split_output_dir, build_scene_split_output_dir_in,
+    build_video_contact_sheet_output_path, build_video_contact_sheet_output_path_in,
+    detect_ffmpeg_binary, export_animation_from_images,
+    export_portfolio_sheet as export_portfolio_sheet_impl,
+    export_video_best_cuts as export_video_best_cuts_impl,
+    export_video_contact_sheet as export_video_contact_sheet_impl,
+    export_video_loop_clip as export_video_loop_clip_impl, frame_extraction_warning,
+    remove_background_warning, resize_media_with_preset, split_video_into_scenes,
 };
 use media_fs::{
-    create_media_folder as create_media_folder_impl,
-    delete_media_file as delete_media_file_impl,
+    create_media_folder as create_media_folder_impl, delete_media_file as delete_media_file_impl,
     delete_media_folder as delete_media_folder_impl,
     duplicate_media_file as duplicate_media_file_impl,
-    duplicate_media_folder as duplicate_media_folder_impl,
-    is_remove_bg_supported_image, media_kind_for_extension,
-    rename_media_file as rename_media_file_impl, scan_media_path,
+    duplicate_media_folder as duplicate_media_folder_impl, is_remove_bg_supported_image,
+    media_kind_for_extension, rename_media_file as rename_media_file_impl, scan_media_path,
 };
 use models::{BackgroundTask, ScanResult};
 use rfd::FileDialog;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, State};
+use tauri::{image::Image, AppHandle, Manager, State};
+
+fn preferred_output_parent(
+    preferred_output_root: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(root) = preferred_output_root else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(root);
+    if !path.exists() {
+        return Err("Preferred output folder no longer exists.".to_string());
+    }
+    if !path.is_dir() {
+        return Err("Preferred output path is not a folder.".to_string());
+    }
+    Ok(Some(path))
+}
 
 #[tauri::command]
 fn pick_root_folder() -> Option<String> {
@@ -82,6 +110,7 @@ fn enqueue_remove_image_background(
     state: State<'_, BackgroundRemovalState>,
     file_path: String,
     engine_key: Option<String>,
+    preferred_output_root: Option<String>,
 ) -> Result<BackgroundTask, String> {
     let source = PathBuf::from(&file_path);
     if !source.exists() {
@@ -111,6 +140,18 @@ fn enqueue_remove_image_background(
         .and_then(|value| value.to_str())
         .unwrap_or("image")
         .to_string();
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_path = if let Some(parent) = preferred_parent.as_deref() {
+        build_remove_bg_output_path_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image"),
+        )?
+    } else {
+        build_remove_bg_output_path(&source)?
+    };
     let task = enqueue_task(
         &app,
         &state.inner,
@@ -118,10 +159,12 @@ fn enqueue_remove_image_background(
             kind: "removeBackground".to_string(),
             engine_key,
             engine_label,
+            input_paths: None,
+            duration_seconds: None,
             extract_eye_mode: None,
             extract_layout: None,
             source_path: source.to_string_lossy().to_string(),
-            output_path: build_remove_bg_output_path(&source)?.to_string_lossy().to_string(),
+            output_path: output_path.to_string_lossy().to_string(),
             file_name,
             warning: remove_background_warning(&source),
         },
@@ -142,6 +185,7 @@ fn enqueue_extract_video_frames(
     preset_key: String,
     eye_mode: Option<String>,
     layout: Option<String>,
+    preferred_output_root: Option<String>,
 ) -> Result<BackgroundTask, String> {
     let source = PathBuf::from(&file_path);
     if !source.exists() {
@@ -188,6 +232,18 @@ fn enqueue_extract_video_frames(
         .unwrap_or("video")
         .to_string();
 
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_path = if let Some(parent) = preferred_parent.as_deref() {
+        build_extract_frames_output_dir_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("video"),
+        )?
+    } else {
+        build_extract_frames_output_dir(&source)?
+    };
     let task = enqueue_task(
         &app,
         &state.inner,
@@ -195,12 +251,12 @@ fn enqueue_extract_video_frames(
             kind: "extractFrames".to_string(),
             engine_key: preset_key,
             engine_label: preset_label,
+            input_paths: None,
+            duration_seconds: None,
             extract_eye_mode: Some(extract_eye_mode),
             extract_layout: Some(extract_layout),
             source_path: source.to_string_lossy().to_string(),
-            output_path: build_extract_frames_output_dir(&source)?
-                .to_string_lossy()
-                .to_string(),
+            output_path: output_path.to_string_lossy().to_string(),
             file_name,
             warning: frame_extraction_warning(&source),
         },
@@ -214,8 +270,238 @@ fn export_image_sequence_animation(
     image_paths: Vec<String>,
     format: String,
     fps: u32,
+    reverse: bool,
+    preferred_output_root: Option<String>,
 ) -> Result<String, String> {
-    export_animation_from_images(&app, &image_paths, &format, fps)
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    export_animation_from_images(
+        &app,
+        &image_paths,
+        &format,
+        fps,
+        reverse,
+        preferred_parent.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn export_video_best_cuts(
+    app: AppHandle,
+    file_path: String,
+    count: usize,
+    threshold: f64,
+    preferred_output_root: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() || !source.is_file() {
+        return Err("Selected video no longer exists.".to_string());
+    }
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_dir = if let Some(parent) = preferred_parent.as_deref() {
+        build_best_cuts_output_dir_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("video"),
+        )?
+    } else {
+        build_best_cuts_output_dir(&source)?
+    };
+    export_video_best_cuts_impl(
+        &app,
+        &file_path,
+        &output_dir.to_string_lossy(),
+        count.max(1),
+        threshold,
+    )?;
+    Ok(output_dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn export_video_contact_sheet(
+    app: AppHandle,
+    file_path: String,
+    columns: u32,
+    rows: u32,
+    preferred_output_root: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() || !source.is_file() {
+        return Err("Selected video no longer exists.".to_string());
+    }
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_path = if let Some(parent) = preferred_parent.as_deref() {
+        build_video_contact_sheet_output_path_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("video"),
+        )?
+    } else {
+        build_video_contact_sheet_output_path(&source)?
+    };
+    export_video_contact_sheet_impl(
+        &app,
+        &file_path,
+        &output_path.to_string_lossy(),
+        columns.max(1),
+        rows.max(1),
+    )?;
+    Ok(output_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn export_video_loop_clip(
+    app: AppHandle,
+    file_path: String,
+    start_seconds: f64,
+    duration_seconds: f64,
+    format: String,
+    fps: u32,
+    preferred_output_root: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() || !source.is_file() {
+        return Err("Selected video no longer exists.".to_string());
+    }
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_path = if let Some(parent) = preferred_parent.as_deref() {
+        build_loop_clip_output_path_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("video"),
+            &format,
+        )?
+    } else {
+        build_loop_clip_output_path(&source, &format)?
+    };
+    export_video_loop_clip_impl(
+        &app,
+        &file_path,
+        &output_path.to_string_lossy(),
+        start_seconds,
+        duration_seconds,
+        &format,
+        fps.max(1),
+    )?;
+    Ok(output_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn split_video_by_scenes(
+    app: AppHandle,
+    file_path: String,
+    threshold: f64,
+    min_scene_seconds: f64,
+    preferred_output_root: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() || !source.is_file() {
+        return Err("Selected video no longer exists.".to_string());
+    }
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_dir = if let Some(parent) = preferred_parent.as_deref() {
+        build_scene_split_output_dir_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("video"),
+        )?
+    } else {
+        build_scene_split_output_dir(&source)?
+    };
+    split_video_into_scenes(
+        &app,
+        &file_path,
+        &output_dir.to_string_lossy(),
+        threshold,
+        min_scene_seconds,
+    )?;
+    Ok(output_dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn export_portfolio_sheet(
+    image_paths: Vec<String>,
+    columns: u32,
+    preferred_output_root: Option<String>,
+) -> Result<String, String> {
+    let paths: Vec<PathBuf> = image_paths.iter().map(PathBuf::from).collect();
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_path = if let Some(parent) = preferred_parent.as_deref() {
+        let base_name = paths
+            .first()
+            .and_then(|path| path.file_stem())
+            .and_then(|value| value.to_str())
+            .unwrap_or("portfolio");
+        build_portfolio_sheet_output_path_in(parent, base_name)?
+    } else {
+        build_portfolio_sheet_output_path(&paths)?
+    };
+    export_portfolio_sheet_impl(&image_paths, &output_path.to_string_lossy(), columns.max(1))?;
+    Ok(output_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn resize_media_file_with_preset(
+    app: AppHandle,
+    file_path: String,
+    preset_key: String,
+    preferred_output_root: Option<String>,
+) -> Result<String, String> {
+    let source = PathBuf::from(&file_path);
+    if !source.exists() || !source.is_file() {
+        return Err("Selected file no longer exists.".to_string());
+    }
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+    let is_video = matches!(
+        extension.as_str(),
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "wmv"
+    );
+    let output_extension = if is_video {
+        "mp4".to_string()
+    } else if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp") {
+        extension.clone()
+    } else {
+        "png".to_string()
+    };
+    let suffix = match preset_key.as_str() {
+        "square_1080" => "sq1080",
+        "story_1080x1920" => "story",
+        "landscape_1920x1080" => "hd",
+        "thumb_1280x720" => "thumb",
+        _ => return Err("Unknown resize preset.".to_string()),
+    };
+    let preferred_parent = preferred_output_parent(preferred_output_root)?;
+    let output_path = if let Some(parent) = preferred_parent.as_deref() {
+        build_resized_output_path_in(
+            parent,
+            source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("file"),
+            suffix,
+            &output_extension,
+        )?
+    } else {
+        build_resized_output_path(&source, suffix, &output_extension)?
+    };
+    resize_media_with_preset(
+        &app,
+        &file_path,
+        &output_path.to_string_lossy(),
+        &preset_key,
+    )?;
+    Ok(output_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -235,6 +521,24 @@ fn clear_finished_background_tasks(state: State<'_, BackgroundRemovalState>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let icon_path = std::env::current_dir()
+                .map(|dir| dir.join("icons").join("32x32.png"))
+                .map_err(|error| error.to_string())?;
+            let icon_image = image::open(&icon_path)
+                .map_err(|error| format!("Failed to open dev icon at {}: {error}", icon_path.display()))?
+                .into_rgba8();
+            let (width, height) = icon_image.dimensions();
+            let icon = Image::new_owned(icon_image.into_raw(), width, height);
+
+            for window in app.webview_windows().values() {
+                window
+                    .set_icon(icon.clone())
+                    .map_err(|error| error.to_string())?;
+            }
+
+            Ok(())
+        })
         .manage(BackgroundRemovalState {
             inner: Arc::new(Mutex::new(BackgroundRemovalQueue::new())),
         })
@@ -251,6 +555,12 @@ pub fn run() {
             enqueue_remove_image_background,
             enqueue_extract_video_frames,
             export_image_sequence_animation,
+            export_video_best_cuts,
+            export_video_contact_sheet,
+            export_video_loop_clip,
+            split_video_by_scenes,
+            export_portfolio_sheet,
+            resize_media_file_with_preset,
             list_background_tasks,
             cancel_background_task,
             clear_finished_background_tasks
