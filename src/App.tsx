@@ -2140,6 +2140,7 @@ function App() {
     actionDialog?.kind === "loopClip"
       ? Math.max(clipDialogStartValue, Number(actionDialog.endSeconds) || 0)
       : 0;
+  const rootPickerLabel = rootPath || "폴더 선택";
 
   useEffect(() => {
     const container = explorerRef.current;
@@ -2264,9 +2265,16 @@ function App() {
               ))}
             </div>
 
-            <div className="flex min-w-0 flex-1 items-center justify-center px-2">
-              <div className="flex w-full max-w-xl items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950/80">
-                <div className="text-[10px] uppercase tracking-[0.18em] text-zinc-500">Search</div>
+            <div className="flex min-w-0 flex-1 items-center justify-center gap-2 px-2">
+              <button
+                type="button"
+                onClick={() => void handlePickRootFolder()}
+                className="max-w-[260px] truncate rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] text-zinc-700 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950/80 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                title={rootPath || "폴더 선택"}
+              >
+                {rootPickerLabel}
+              </button>
+              <div className="flex w-full max-w-xl items-center rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950/80">
                 <input
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
@@ -2285,55 +2293,72 @@ function App() {
           className="flex min-h-0 shrink-0 flex-col border-r border-zinc-200 bg-white/90 dark:border-zinc-800 dark:bg-[#121217]"
           style={{ width: `${folderWidth}px` }}
         >
-          <div className="shrink-0 border-b border-zinc-200 p-3 dark:border-zinc-800">
-              <div className="flex items-center gap-2">
-                <div className="min-w-0 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                  {rootFolderName || "No folder"}{rootPath ? ` / ${rootPath}` : ""}
-                </div>
-              </div>
-
-            <div className="mt-3">
-              <button
-                className="w-full rounded-lg bg-zinc-950 px-3 py-1.5 text-[12px] font-semibold text-white hover:bg-zinc-800 disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-zinc-950 dark:hover:bg-zinc-200"
-                type="button"
-                onClick={handlePickRootFolder}
-                disabled={isLoading || isSaving}
-              >
-                {isLoading ? "Scanning..." : "Choose Folder"}
-              </button>
+          <div className="shrink-0 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
+            <div className="min-w-0 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
+              {rootFolderName || "No folder"}{rootPath ? ` / ${rootPath}` : ""}
             </div>
-
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-3 pt-2">
-            <div className="mt-2.5 grid shrink-0 grid-cols-3 gap-2">
-              <select
-                className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
-                value={kindFilter}
-                onChange={(event) => setKindFilter(event.target.value as "all" | MediaKind)}
-              >
-                <option value="all">All</option>
-                <option value="image">Image</option>
-                <option value="video">Video</option>
-                <option value="zip">ZIP</option>
-              </select>
-              <select
-                className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
-                value={sortKey}
-                onChange={(event) => setSortKey(event.target.value as SortKey)}
-              >
-                <option value="date">Date</option>
-                <option value="name">Name</option>
-                <option value="size">Size</option>
-              </select>
-              <select
-                className="rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[10px]"
-                value={sortDirection}
-                onChange={(event) => setSortDirection(event.target.value as "asc" | "desc")}
-              >
-                <option value="desc">Desc</option>
-                <option value="asc">Asc</option>
-              </select>
+            <div className="mt-2.5 shrink-0 space-y-2">
+              <div className="grid grid-cols-4 gap-2">
+                {(
+                  [
+                    ["all", "All"],
+                    ["image", "Image"],
+                    ["video", "Video"],
+                    ["zip", "ZIP"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setKindFilter(key)}
+                    className={classNames(
+                      "rounded-md border px-2 py-1.5 text-[10px] transition",
+                      kindFilter === key
+                        ? "border-white bg-white text-zinc-950"
+                        : "border-zinc-800 bg-zinc-950 text-zinc-300 hover:bg-zinc-900",
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
+                {(
+                  [
+                    ["name", "Name"],
+                    ["date", "Date"],
+                    ["size", "Size"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setSortKey(key)}
+                    className={classNames(
+                      "rounded-md border px-2 py-1.5 text-[10px] transition",
+                      sortKey === key
+                        ? "border-white bg-white text-zinc-950"
+                        : "border-zinc-800 bg-zinc-950 text-zinc-300 hover:bg-zinc-900",
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSortDirection((prev) => (prev === "desc" ? "asc" : "desc"))
+                  }
+                  className="rounded-md border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[10px] text-zinc-300 hover:bg-zinc-900"
+                  title={sortDirection === "desc" ? "Descending" : "Ascending"}
+                >
+                  {sortDirection === "desc" ? "↓" : "↑"}
+                </button>
+              </div>
             </div>
 
             <div className="mt-2.5 flex min-h-0 flex-1 flex-col rounded-xl border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-800 dark:bg-zinc-950/60">
