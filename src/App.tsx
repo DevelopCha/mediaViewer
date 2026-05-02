@@ -1,4 +1,4 @@
-import {
+﻿import {
   startTransition,
   type MouseEvent as ReactMouseEvent,
   type SyntheticEvent,
@@ -10,13 +10,20 @@ import {
   useRef,
   useState,
 } from "react";
-import { FolderTreeBranch, MediaListRow } from "./components/media-browser-parts";
+import { ExplorerTable, type ExplorerTableEntry } from "./components/media-browser-parts";
 import { clamp, clampMenuPosition, classNames, formatBytes, formatDate } from "./lib/format";
-import { bi, biCount } from "./lib/i18n";
 import {
-  buildFilesByFolder,
+  LOCALE_OPTIONS,
+  LOCALE_STORAGE_KEY,
+  bi,
+  biCount,
+  getInitialLocale,
+  setCurrentLocale,
+  type Locale,
+} from "./lib/i18n";
+import {
   buildFolderTree,
-  buildVisibleTreeEntries,
+  compareNaturalText,
   filterMediaItems,
   findMediaById,
   findMediaByPath,
@@ -26,7 +33,6 @@ import {
   type MediaItem,
   type MediaKind,
   type SortKey,
-  type TreeVisibleEntry,
 } from "./lib/media-browser";
 import {
   BACKGROUND_ENGINES,
@@ -122,19 +128,28 @@ const IMAGE_ZOOM_MIN = 0.5;
 const IMAGE_ZOOM_MAX = 6;
 const IMAGE_ZOOM_STEP = 0.2;
 const ANIMATION_PREVIEW_FPS_MAX = 120;
-const LIST_ITEM_HEIGHT = 62;
-const DEFAULT_FOLDER_WIDTH = 276;
-const MIN_FOLDER_WIDTH = 220;
-const MAX_FOLDER_WIDTH = 460;
+const DEFAULT_FOLDER_WIDTH = 760;
+const MIN_FOLDER_WIDTH = 280;
+const MAX_FOLDER_WIDTH = 1200;
 const CONTEXT_MENU_WIDTH = 176;
 const CONTEXT_SUBMENU_WIDTH = 224;
 const MENU_VIEWPORT_MARGIN = 12;
-const RESIZE_PRESET_LABELS: Record<ResizePresetKey, string> = {
-  square_1080: bi("Square 1080x1080", "정사각형 1080x1080"),
-  story_1080x1920: bi("Story 1080x1920", "스토리 1080x1920"),
-  landscape_1920x1080: bi("Landscape 1920x1080", "가로형 1920x1080"),
-  thumb_1280x720: bi("Thumbnail 1280x720", "썸네일 1280x720"),
-};
+const FILTER_KINDS: MediaKind[] = ["image", "video", "document", "zip"];
+
+function getResizePresetLabel(key: ResizePresetKey) {
+  switch (key) {
+    case "square_1080":
+      return bi("Square 1080x1080", "정사각형 1080x1080");
+    case "story_1080x1920":
+      return bi("Story 1080x1920", "스토리 1080x1920");
+    case "landscape_1920x1080":
+      return bi("Landscape 1920x1080", "가로형 1920x1080");
+    case "thumb_1280x720":
+      return bi("Thumbnail 1280x720", "썸네일 1280x720");
+    default:
+      return key;
+  }
+}
 
 function formatSecondsLabel(value: number) {
   const safe = Math.max(0, value);
@@ -175,8 +190,26 @@ function isArchiveRootPath(path: string) {
   return path.trim().toLowerCase().endsWith(".zip");
 }
 
+function areAllKindsSelected(kindFilter: Set<MediaKind>) {
+  return FILTER_KINDS.every((kind) => kindFilter.has(kind));
+}
+
+function getDefaultFolderWidth() {
+  if (typeof window === "undefined") {
+    return DEFAULT_FOLDER_WIDTH;
+  }
+
+  const halfViewportWidth = Math.floor(window.innerWidth * 0.5);
+  return clamp(halfViewportWidth, MIN_FOLDER_WIDTH, MAX_FOLDER_WIDTH);
+}
+
 function App() {
-  const [kindFilter, setKindFilter] = useState<"all" | MediaKind>("all");
+  const [locale, setLocale] = useState<Locale>(() => {
+    const initialLocale = getInitialLocale();
+    setCurrentLocale(initialLocale);
+    return initialLocale;
+  });
+  const [kindFilter, setKindFilter] = useState<Set<MediaKind>>(() => new Set(FILTER_KINDS));
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
@@ -204,7 +237,7 @@ function App() {
   const [manualOpen, setManualOpen] = useState(false);
   const [showFolders, setShowFolders] = useState(true);
   const [showPreview, setShowPreview] = useState(true);
-  const [folderWidth, setFolderWidth] = useState(DEFAULT_FOLDER_WIDTH);
+  const [folderWidth, setFolderWidth] = useState(() => getDefaultFolderWidth());
   const [expandedFolderPaths, setExpandedFolderPaths] = useState<Set<string>>(new Set([""]));
   const [selectedFolderPath, setSelectedFolderPath] = useState("");
   const [explorerSelection, setExplorerSelection] = useState<ExplorerSelection>({
@@ -232,6 +265,8 @@ function App() {
   const [actionDialog, setActionDialog] = useState<ActionDialogState | null>(null);
   const [clipPreviewDuration, setClipPreviewDuration] = useState(0);
   const [clipPreviewCurrentTime, setClipPreviewCurrentTime] = useState(0);
+  const [documentPreview, setDocumentPreview] = useState("");
+  const [documentPreviewLoading, setDocumentPreviewLoading] = useState(false);
   const explorerRef = useRef<HTMLDivElement | null>(null);
   const clipPreviewRef = useRef<HTMLVideoElement | null>(null);
   const dragStateRef = useRef<{
@@ -247,17 +282,29 @@ function App() {
   const backgroundRefreshTimeoutRef = useRef<number | null>(null);
   const headerMenuRef = useRef<HTMLDivElement | null>(null);
 
+  useEffect(() => {
+    setCurrentLocale(locale);
+    if (typeof document !== "undefined") {
+      document.documentElement.lang = locale;
+    }
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+    }
+  }, [locale]);
+
   const deferredQuery = useDeferredValue(query);
   const browsingZipFolder = isVirtualZipFolderPath(selectedFolderPath);
-  const listKindFilter = browsingZipFolder && kindFilter === "zip" ? "all" : kindFilter;
+  const listKindFilter = useMemo(() => {
+    if (!browsingZipFolder) {
+      return kindFilter;
+    }
+    const next = new Set(kindFilter);
+    next.add("zip");
+    return next;
+  }, [browsingZipFolder, kindFilter]);
 
   const treeSourceItems = useMemo(
-    () =>
-      kindFilter === "all"
-        ? items
-        : kindFilter === "zip"
-          ? items.filter((item) => item.kind === "zip" || item.archivePath)
-          : items.filter((item) => item.kind === kindFilter),
+    () => items.filter((item) => kindFilter.has(item.kind) || (item.archivePath && kindFilter.has("zip"))),
     [items, kindFilter],
   );
 
@@ -266,7 +313,6 @@ function App() {
     [rootFolderName, treeSourceItems],
   );
 
-  const selectedFolderNode = folderTree.get(selectedFolderPath) ?? folderTree.get("");
 
   function isArchiveEntry(item: MediaItem) {
     return Boolean(item.archivePath);
@@ -274,6 +320,25 @@ function App() {
 
   function isVirtualZipFolderPath(path: string) {
     return path.toLowerCase().includes(".zip");
+  }
+
+  function toggleKindFilter(kind: "all" | MediaKind) {
+    setKindFilter((prev) => {
+      if (kind === "all") {
+        return areAllKindsSelected(prev) ? new Set(FILTER_KINDS) : new Set(FILTER_KINDS);
+      }
+
+      const next = new Set(prev);
+      if (next.has(kind)) {
+        if (next.size === 1) {
+          return prev;
+        }
+        next.delete(kind);
+      } else {
+        next.add(kind);
+      }
+      return next;
+    });
   }
 
   function zipFolderItems(path: string) {
@@ -340,9 +405,7 @@ function App() {
       });
 
       expandFolderHierarchy(item.relativePath);
-      if (kindFilter === "zip") {
-        setKindFilter("all");
-      }
+      setKindFilter((prev) => new Set([...prev, "zip"]));
       setSelectedFolderPath(item.relativePath);
       setExplorerSelection({
         type: "file",
@@ -359,32 +422,28 @@ function App() {
       setIsLoading(false);
     }
 
-    if (kindFilter === "zip") {
-      setKindFilter("all");
-    }
+    setKindFilter((prev) => new Set([...prev, "zip"]));
     return true;
   }
 
   function handleFolderSelect(path: string) {
-    if (kindFilter === "zip" && isVirtualZipFolderPath(path)) {
-      setKindFilter("all");
+    expandFolderHierarchy(path);
+    if (isVirtualZipFolderPath(path)) {
+      setKindFilter((prev) => new Set([...prev, "zip"]));
     }
     setSelectedFolderPath(path);
-    setExplorerSelection({ type: "folder", path });
+    highlightFolderEntry(path);
+    selectFolderContents(path);
     const zipRootItem = items.find(
       (item) => item.kind === "zip" && !item.archivePath && item.relativePath === path,
     );
     const folderItems = isVirtualZipFolderPath(path)
-      ? zipFolderItems(path)
-      : treeSourceItems.filter((item) => (path ? item.relativePath.startsWith(`${path}/`) : true));
+      ? zipFolderItems(path).filter((item) => parentFolderPath(item.relativePath) === path)
+      : treeSourceItems.filter((item) => parentFolderPath(item.relativePath) === path);
     if (zipRootItem) {
-      setSelectedItemIds(new Set([zipRootItem.id]));
-      setSelectionAnchorId(zipRootItem.id);
       setActiveId(zipRootItem.id);
       return;
     }
-    setSelectedItemIds(new Set(folderItems.map((item) => item.id)));
-    setSelectionAnchorId(folderItems[0]?.id ?? null);
     const node = folderTree.get(path);
     if (!node?.coverPath) {
       setActiveId(folderItems[0]?.id ?? null);
@@ -395,6 +454,31 @@ function App() {
     setActiveId(coverItem?.id ?? folderItems[0]?.id ?? null);
   }
 
+  function highlightFolderEntry(path: string) {
+    setExplorerSelection({ type: "folder", path });
+  }
+
+  function folderSelectionItems(path: string) {
+    const prefix = path ? `${path}/` : "";
+    return treeSourceItems.filter((item) =>
+      path ? item.relativePath.startsWith(prefix) : true,
+    );
+  }
+
+  function selectFolderContents(path: string) {
+    const folderItems = sortMediaItems(folderSelectionItems(path), sortKey, sortDirection);
+    setSelectedItemIds(new Set(folderItems.map((item) => item.id)));
+    setSelectionAnchorId(folderItems[0]?.id ?? null);
+    setActiveId((current) =>
+      current && folderItems.some((item) => item.id === current) ? current : folderItems[0]?.id ?? current,
+    );
+  }
+
+  function clearExplorerSelection() {
+    setSelectedItemIds(new Set());
+    setSelectionAnchorId(null);
+  }
+
   const filtered = useMemo(
     () =>
       filterMediaItems(items, {
@@ -402,7 +486,7 @@ function App() {
         kindFilter: listKindFilter,
         query: deferredQuery,
         includeArchiveEntries: browsingZipFolder,
-      }),
+      }).filter((item) => parentFolderPath(item.relativePath) === selectedFolderPath),
     [browsingZipFolder, deferredQuery, items, listKindFilter, selectedFolderPath],
   );
 
@@ -417,18 +501,13 @@ function App() {
   );
 
   const sorted = useMemo(() => {
-    const next = sortMediaItems(filtered, sortKey);
-    return sortDirection === "asc" ? [...next].reverse() : next;
+    return sortMediaItems(filtered, sortKey, sortDirection);
   }, [filtered, sortDirection, sortKey]);
   const sortedTreeItems = useMemo(
-    () => {
-      const next = sortMediaItems(treeFilteredItems, sortKey);
-      return sortDirection === "asc" ? [...next].reverse() : next;
-    },
+    () => sortMediaItems(treeFilteredItems, sortKey, sortDirection),
     [sortDirection, sortKey, treeFilteredItems],
   );
 
-  const filesByFolder = useMemo(() => buildFilesByFolder(sortedTreeItems), [sortedTreeItems]);
   const itemMaps = useMemo(() => buildItemMaps(items), [items]);
   const selectedItems = useMemo(
     () =>
@@ -471,6 +550,49 @@ function App() {
     () => (active ? assetUrl(active.path) : ""),
     [active?.path],
   );
+
+  useEffect(() => {
+    if (!active || active.kind !== "document") {
+      setDocumentPreview("");
+      setDocumentPreviewLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDocumentPreviewLoading(true);
+    setDocumentPreview("");
+
+    void fetch(assetUrl(active.path))
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to read document file (${response.status}).`);
+        }
+        return response.text();
+      })
+      .then((text) => {
+        if (!cancelled) {
+          setDocumentPreview(text);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setDocumentPreview(
+            error instanceof Error
+              ? error.message
+              : bi("Failed to load the document preview.", "문서 미리보기를 불러오지 못했습니다."),
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setDocumentPreviewLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [active?.id, active?.kind, active?.path]);
   useEffect(() => {
     setRenameValue(active?.name ?? "");
   }, [active?.id, active?.name]);
@@ -1154,38 +1276,97 @@ function App() {
   }
 
   const isSearchMode = deferredQuery.trim().length > 0;
-
-  const visibleTreeEntries = useMemo(() => {
+  const explorerEntries = useMemo<ExplorerTableEntry[]>(() => {
     if (isSearchMode) {
-      return sortedTreeItems.map(
-        (item, index) =>
-          ({
-            type: "file",
-            key: `search-file:${item.id}:${index}`,
-            id: item.id,
-            path: item.path,
-            parentPath: parentFolderPath(item.relativePath),
-            depth: 0,
-          }) satisfies TreeVisibleEntry,
-      );
+      return sortedTreeItems.map((item) => ({
+        type: "file",
+        key: `search-file:${item.id}`,
+        item,
+        depth: 0,
+      }));
     }
 
-    return buildVisibleTreeEntries("", folderTree, expandedFolderPaths, filesByFolder);
-  }, [expandedFolderPaths, filesByFolder, folderTree, isSearchMode, sortedTreeItems]);
+    const node = folderTree.get(selectedFolderPath) ?? folderTree.get("");
+    if (!node) return [];
 
-  const selectionOrderedItems = useMemo(() => {
-    if (isSearchMode) {
-      return sortedTreeItems;
-    }
+    const buildEntries = (folderPath: string, depth: number): ExplorerTableEntry[] => {
+      const currentNode = folderTree.get(folderPath);
+      if (!currentNode) return [];
 
-    const visibleFileIds = visibleTreeEntries
-      .filter((entry): entry is Extract<TreeVisibleEntry, { type: "file" }> => entry.type === "file")
-      .map((entry) => entry.id);
+      const folderEntries: ExplorerTableEntry[] = currentNode.children.map((childPath) => {
+        const childNode = folderTree.get(childPath);
+        return {
+          type: "folder",
+          key: `folder:${childPath}`,
+          path: childPath,
+          name: childNode?.name ?? childPath,
+          itemCount: childNode?.itemCount ?? 0,
+          depth,
+          canExpand: Boolean((childNode?.children.length ?? 0) > 0 || sortedTreeItems.some((item) => parentFolderPath(item.relativePath) === childPath)),
+          isExpanded: expandedFolderPaths.has(childPath),
+        } satisfies ExplorerTableEntry;
+      });
 
-    return visibleFileIds
-      .map((id) => itemMaps.byId.get(id) ?? null)
-      .filter((item): item is MediaItem => item !== null);
-  }, [isSearchMode, itemMaps, sortedTreeItems, visibleTreeEntries]);
+      const fileEntries: ExplorerTableEntry[] = sortedTreeItems
+        .filter((item) => parentFolderPath(item.relativePath) === folderPath)
+        .map((item) => ({
+          type: "file",
+          key: `file:${item.id}`,
+          item,
+          depth,
+        }));
+
+      const rows = [...folderEntries, ...fileEntries].sort((a, b) => {
+        if (a.type !== b.type) {
+          return a.type === "folder" ? -1 : 1;
+        }
+
+        if (a.type === "folder" && b.type === "folder") {
+          return compareNaturalText(a.name, b.name);
+        }
+
+        if (a.type === "file" && b.type === "file") {
+          const [left, right] = [a.item, b.item];
+          switch (sortKey) {
+            case "name":
+              return sortDirection === "desc"
+                ? compareNaturalText(right.name, left.name) || compareNaturalText(right.ext, left.ext)
+                : compareNaturalText(left.name, right.name) || compareNaturalText(left.ext, right.ext);
+            case "ext":
+              return sortDirection === "desc"
+                ? compareNaturalText(right.ext, left.ext) || compareNaturalText(right.name, left.name)
+                : compareNaturalText(left.ext, right.ext) || compareNaturalText(left.name, right.name);
+            case "size":
+              return sortDirection === "desc" ? right.sizeBytes - left.sizeBytes : left.sizeBytes - right.sizeBytes;
+            case "date":
+            default:
+              return sortDirection === "desc" ? right.modifiedMs - left.modifiedMs : left.modifiedMs - right.modifiedMs;
+          }
+        }
+
+        return 0;
+      });
+
+      const expandedRows: ExplorerTableEntry[] = [];
+      for (const row of rows) {
+        expandedRows.push(row);
+        if (row.type === "folder" && row.isExpanded) {
+          expandedRows.push(...buildEntries(row.path, depth + 1));
+        }
+      }
+      return expandedRows;
+    };
+
+    return buildEntries(selectedFolderPath, 0);
+  }, [expandedFolderPaths, folderTree, isSearchMode, selectedFolderPath, sortDirection, sortKey, sortedTreeItems]);
+
+  const selectionOrderedItems = useMemo(
+    () =>
+      explorerEntries
+        .filter((entry): entry is Extract<ExplorerTableEntry, { type: "file" }> => entry.type === "file")
+        .map((entry) => entry.item),
+    [explorerEntries],
+  );
 
   const animationPreviewItems = useMemo(() => {
     const frameSet = new Set(animationPreviewFrameIds);
@@ -1195,18 +1376,6 @@ function App() {
 
   const currentAnimationFrame = animationPreviewItems[animationPreviewIndex] ?? null;
   const currentAnimationFrameUrl = currentAnimationFrame ? assetUrl(currentAnimationFrame.path) : "";
-
-  function toggleFolderExpanded(path: string) {
-    setExpandedFolderPaths((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) {
-        next.delete(path);
-      } else {
-        next.add(path);
-      }
-      return next;
-    });
-  }
 
   function togglePane(pane: PaneKey) {
     const next = {
@@ -1226,7 +1395,7 @@ function App() {
   function resetLayout() {
     setShowFolders(true);
     setShowPreview(true);
-    setFolderWidth(DEFAULT_FOLDER_WIDTH);
+    setFolderWidth(getDefaultFolderWidth());
   }
 
   function startResize(event: ReactMouseEvent<HTMLDivElement>) {
@@ -1265,7 +1434,8 @@ function App() {
 
   function handleFolderContextMenu(event: ReactMouseEvent<HTMLButtonElement>, path: string) {
     event.preventDefault();
-    handleFolderSelect(path);
+    highlightFolderEntry(path);
+    selectFolderContents(path);
     setContextMenu({
       x: event.clientX,
       y: event.clientY,
@@ -1636,79 +1806,56 @@ function App() {
     applyItemSelection(event, item);
   }
 
+  function toggleFolderExpand(path: string) {
+    setExpandedFolderPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      next.add("");
+      return next;
+    });
+  }
+
   function moveTreeSelection(delta: -1 | 1) {
-    if (!visibleTreeEntries.length) return;
+    if (!explorerEntries.length) return;
 
     const currentIndex =
       explorerSelection.type === "file"
-        ? visibleTreeEntries.findIndex(
-            (entry) => entry.type === "file" && entry.id === explorerSelection.id,
+        ? explorerEntries.findIndex(
+            (entry) => entry.type === "file" && entry.item.id === explorerSelection.id,
           )
-        : visibleTreeEntries.findIndex(
+        : explorerEntries.findIndex(
             (entry) => entry.type === "folder" && entry.path === explorerSelection.path,
           );
 
     const baseIndex = currentIndex >= 0 ? currentIndex : 0;
-    const nextIndex = Math.max(0, Math.min(visibleTreeEntries.length - 1, baseIndex + delta));
-    const entry = visibleTreeEntries[nextIndex];
+    const nextIndex = Math.max(0, Math.min(explorerEntries.length - 1, baseIndex + delta));
+    const entry = explorerEntries[nextIndex];
     if (!entry) return;
 
     if (entry.type === "folder") {
-      handleFolderSelect(entry.path);
+      setExplorerSelection({ type: "folder", path: entry.path });
+      setSelectedItemIds(new Set());
       return;
     }
 
-    const item = items.find((candidate) => candidate.id === entry.id);
-    if (item) {
-      selectSingleItem(item);
-    }
+    selectSingleItem(entry.item);
   }
 
   function openSelectedFolder() {
-    const selectedFolderEntry =
-      explorerSelection.type === "file"
-        ? visibleTreeEntries.find(
-            (entry) =>
-              entry.type === "folder" && entry.path === explorerSelection.parentPath,
-          )
-        : visibleTreeEntries.find(
-            (entry) => entry.type === "folder" && entry.path === explorerSelection.path,
-          );
-
-    if (
-      selectedFolderEntry &&
-      selectedFolderEntry.type === "folder" &&
-      selectedFolderEntry.canExpand &&
-      !selectedFolderEntry.isExpanded
-    ) {
-      toggleFolderExpanded(selectedFolderEntry.path);
+    if (explorerSelection.type === "folder") {
+      handleFolderSelect(explorerSelection.path);
       return;
     }
 
-    if (explorerSelection.type === "file") {
-      return;
-    }
-
-    if (
-      selectedFolderEntry &&
-      selectedFolderEntry.type === "folder" &&
-      selectedFolderEntry.isExpanded
-    ) {
-      const nextEntryIndex = visibleTreeEntries.findIndex(
-        (entry) => entry.type === "folder" && entry.path === selectedFolderEntry.path,
-      );
-      const nextEntry = visibleTreeEntries[nextEntryIndex + 1];
-      if (!nextEntry) return;
-
-      if (nextEntry.type === "folder") {
-        handleFolderSelect(nextEntry.path);
-        return;
-      }
-
-      const item = items.find((candidate) => candidate.id === nextEntry.id);
-      if (item) {
-        selectSingleItem(item);
-      }
+    const activeEntry = explorerEntries.find(
+      (entry) => entry.type === "file" && entry.item.id === explorerSelection.id,
+    );
+    if (activeEntry?.type === "file" && hasZipChildren(activeEntry.item)) {
+      handleFolderSelect(activeEntry.item.relativePath);
     }
   }
 
@@ -1718,18 +1865,7 @@ function App() {
       return;
     }
 
-    const selectedFolderEntry = visibleTreeEntries.find(
-      (entry) => entry.type === "folder" && entry.path === explorerSelection.path,
-    );
-
-    if (!selectedFolderEntry || selectedFolderEntry.type !== "folder") return;
-
-    if (selectedFolderEntry.isExpanded) {
-      toggleFolderExpanded(selectedFolderEntry.path);
-      return;
-    }
-
-    handleFolderSelect(parentFolderPath(selectedFolderEntry.path));
+    handleFolderSelect(parentFolderPath(explorerSelection.path));
   }
 
   function handleVideoMetadata(event: SyntheticEvent<HTMLVideoElement>) {
@@ -1795,7 +1931,10 @@ function App() {
       <div className="relative z-10 mt-[22rem] px-6 text-center text-zinc-400">
         <div className="text-lg font-semibold">{bi("Nothing selected", "선택된 항목 없음")}</div>
         <div className="mt-2 text-sm">
-          Pick a folder or ZIP archive and choose a file from the list.
+          {bi(
+            "Pick a folder or ZIP archive and choose a file from the list.",
+            "폴더나 ZIP 파일을 고른 뒤 목록에서 파일을 선택하세요.",
+          )}
         </div>
       </div>
     </div>
@@ -1810,6 +1949,19 @@ function App() {
       />
     ) : active.kind === "video" ? (
       renderVideoPreview()
+    ) : active.kind === "document" ? (
+      <div className="flex h-full w-full justify-center overflow-auto bg-zinc-50 p-6 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+        <div className="w-full max-w-4xl">
+          <div className="mb-4 text-left text-[11px] uppercase tracking-[0.16em] text-zinc-500 dark:text-zinc-400">
+            {documentPreviewLoading
+              ? bi("Loading document...", "문서 불러오는 중...")
+              : bi("Document Preview", "문서 미리보기")}
+          </div>
+          <pre className="whitespace-pre-wrap break-words font-mono text-[13px] leading-6">
+            {documentPreview}
+          </pre>
+        </div>
+      </div>
     ) : (
       <div className="text-center text-zinc-400">
         <div className="text-lg font-semibold">{bi("ZIP archive selected", "ZIP 압축파일 선택됨")}</div>
@@ -1929,7 +2081,7 @@ function App() {
     renameOpen,
     selectedFolderPath,
     viewerExpanded,
-    visibleTreeEntries,
+    explorerEntries,
   ]);
 
   useEffect(() => {
@@ -2061,7 +2213,8 @@ function App() {
     contextMenuSelectionVideos.length === 1 ? contextMenuSelectionVideos[0] : null;
   const contextMenuFolderWritable =
     contextMenuFolderPath !== null && !isVirtualZipFolderPath(contextMenuFolderPath);
-  const folderEntryCount = contextMenuFolderWritable ? 1 + (contextMenuFolderPath ? 2 : 0) : 0;
+  const folderSelectionEntryCount = contextMenuFolderPath !== null ? 2 : 0;
+  const folderEntryCount = (contextMenuFolderWritable ? 1 + (contextMenuFolderPath ? 2 : 0) : 0) + folderSelectionEntryCount;
   const fileActionEntryCount =
     (contextMenuSelectionImages.length >= 1 ? 1 : 0) +
     (contextMenuSelectionImages.length >= 2 ? 1 : 0) +
@@ -2174,7 +2327,7 @@ function App() {
       `[data-tree-key="${selectedExplorerKey}"]`,
     );
     target?.scrollIntoView({ block: "nearest" });
-  }, [selectedExplorerKey, visibleTreeEntries]);
+  }, [explorerEntries, selectedExplorerKey]);
 
   return (
     <div className="dark relative h-dvh w-dvw overflow-hidden bg-zinc-100 text-[12px] text-zinc-950 dark:bg-[#0d0d10] dark:text-zinc-50">
@@ -2186,7 +2339,6 @@ function App() {
               {(
                 [
                   ["file", bi("File", "파일")],
-                  ["view", bi("View", "보기")],
                   ["help", bi("Help", "도움말")],
                 ] as const
               ).map(([key, label]) => (
@@ -2226,44 +2378,6 @@ function App() {
                           </button>
                         </>
                       ) : null}
-                      {key === "view" ? (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setHeaderMenuOpen(null);
-                              togglePane("folders");
-                            }}
-                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
-                          >
-                            {showFolders
-                              ? bi("Hide Folders", "폴더 숨기기")
-                              : bi("Show Folders", "폴더 표시")}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setHeaderMenuOpen(null);
-                              togglePane("preview");
-                            }}
-                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
-                          >
-                            {showPreview
-                              ? bi("Hide Preview", "미리보기 숨기기")
-                              : bi("Show Preview", "미리보기 표시")}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setHeaderMenuOpen(null);
-                              resetLayout();
-                            }}
-                            className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
-                          >
-                            {bi("Reset Layout", "레이아웃 초기화")}
-                          </button>
-                        </>
-                      ) : null}
                       {key === "help" ? (
                         <>
                           <button
@@ -2294,25 +2408,76 @@ function App() {
               ))}
             </div>
 
-            <div className="flex min-w-0 flex-1 items-center justify-center gap-2 px-2">
-              <button
-                type="button"
-                onClick={() => void handlePickRootFolder()}
-                className="max-w-[260px] truncate rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] text-zinc-700 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950/80 dark:text-zinc-200 dark:hover:bg-zinc-900"
-                title={rootPath || rootPickerLabel}
-              >
-                {rootPickerLabel}
-              </button>
-              <div className="flex w-full max-w-xl items-center rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950/80">
-                <input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder={bi("Search files, folders, ZIP contents", "파일, 폴더, ZIP 내용을 검색")}
-                  className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-zinc-500"
-                />
+            <div className="flex min-w-0 flex-1" />
+            <div className="flex items-center justify-end gap-2">
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => togglePane("folders")}
+                  title={showFolders ? bi("Hide Folders", "폴더 숨기기") : bi("Show Folders", "폴더 표시")}
+                  aria-label={showFolders ? bi("Hide Folders", "폴더 숨기기") : bi("Show Folders", "폴더 표시")}
+                  className={classNames(
+                    "flex h-8 w-10 items-center justify-center rounded-md border transition",
+                    showFolders
+                      ? "border-zinc-400 bg-zinc-200 text-zinc-950 dark:border-zinc-600 dark:bg-zinc-200 dark:text-zinc-950"
+                      : "border-zinc-300 bg-transparent text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900",
+                  )}
+                >
+                  <div className="flex items-center gap-1">
+                    <div className="grid h-4 w-3 grid-rows-2 gap-0.5">
+                      <span className="rounded-[2px] border border-current" />
+                      <span className="rounded-[2px] border border-current" />
+                    </div>
+                    <span className="text-[9px] font-bold leading-none">F</span>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => togglePane("preview")}
+                  title={showPreview ? bi("Hide Preview", "미리보기 숨기기") : bi("Show Preview", "미리보기 표시")}
+                  aria-label={showPreview ? bi("Hide Preview", "미리보기 숨기기") : bi("Show Preview", "미리보기 표시")}
+                  className={classNames(
+                    "flex h-8 w-10 items-center justify-center rounded-md border transition",
+                    showPreview
+                      ? "border-zinc-400 bg-zinc-200 text-zinc-950 dark:border-zinc-600 dark:bg-zinc-200 dark:text-zinc-950"
+                      : "border-zinc-300 bg-transparent text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900",
+                  )}
+                >
+                  <div className="flex items-center gap-1">
+                    <div className="h-4 w-3 overflow-hidden rounded-[2px] border border-current">
+                      <span className="block h-full w-full bg-current/20" />
+                    </div>
+                    <span className="text-[9px] font-bold leading-none">P</span>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={resetLayout}
+                  title={bi("Reset Layout", "레이아웃 초기화")}
+                  aria-label={bi("Reset Layout", "레이아웃 초기화")}
+                  className="flex h-8 w-10 items-center justify-center rounded-md border border-zinc-300 bg-transparent text-zinc-500 transition hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-900"
+                >
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] leading-none">↺</span>
+                    <span className="text-[9px] font-bold leading-none">R</span>
+                  </div>
+                </button>
               </div>
+              <label className="flex items-center gap-2 text-[11px] text-zinc-600 dark:text-zinc-300">
+                <span>{bi("Language", "언어")}</span>
+                <select
+                  value={locale}
+                  onChange={(event) => setLocale(event.target.value as Locale)}
+                  className="rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-[11px] text-zinc-700 outline-none hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950/80 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                >
+                  {LOCALE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
-            <div className="w-[120px]" />
           </div>
         </header>
 
@@ -2322,32 +2487,46 @@ function App() {
           className="flex min-h-0 shrink-0 flex-col border-r border-zinc-200 bg-white/90 dark:border-zinc-800 dark:bg-[#121217]"
           style={{ width: `${folderWidth}px` }}
         >
-          <div className="shrink-0 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
-            <div className="min-w-0 truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-              {rootFolderName || bi("No folder", "선택된 폴더 없음")}{rootPath ? ` / ${rootPath}` : ""}
-            </div>
-          </div>
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-2.5">
+            <div className="shrink-0 space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void handlePickRootFolder()}
+                  className="max-w-[140px] shrink-0 truncate rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 text-[10px] text-zinc-700 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-950/80 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                  title={rootPath || rootPickerLabel}
+                >
+                  {rootPickerLabel}
+                </button>
+                <div className="flex min-w-0 flex-1 items-center rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 dark:border-zinc-800 dark:bg-zinc-950/80">
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder={bi("Search files, folders, ZIP contents", "파일, 폴더, ZIP 내용을 검색")}
+                    className="min-w-0 flex-1 bg-transparent text-[10px] outline-none placeholder:text-zinc-500"
+                  />
+                </div>
+              </div>
 
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-3 pt-2">
-            <div className="mt-2.5 shrink-0 space-y-2">
-              <div className="grid grid-cols-4 gap-2">
+              <div className="grid grid-cols-5 gap-1">
                 {(
                   [
                     ["all", bi("All", "전체")],
                     ["image", bi("Image", "이미지")],
                     ["video", bi("Video", "영상")],
+                    ["document", bi("Document", "문서")],
                     ["zip", "ZIP"],
                   ] as const
                 ).map(([key, label]) => (
                   <button
                     key={key}
                     type="button"
-                    onClick={() => setKindFilter(key)}
+                    onClick={() => toggleKindFilter(key)}
                     className={classNames(
-                      "rounded-md border px-2 py-1.5 text-[10px] transition",
-                      kindFilter === key
-                        ? "border-white bg-white text-zinc-950"
-                        : "border-zinc-800 bg-zinc-950 text-zinc-300 hover:bg-zinc-900",
+                      "rounded-md border px-1.5 py-1 text-[8px] transition",
+                      (key === "all" ? areAllKindsSelected(kindFilter) : kindFilter.has(key))
+                        ? "border-sky-300 bg-sky-50 font-bold text-sky-700 dark:border-sky-700 dark:bg-sky-950/45 dark:text-sky-200"
+                        : "border-zinc-800 bg-zinc-950 text-zinc-500 hover:bg-zinc-900 dark:text-zinc-500",
                     )}
                   >
                     {label}
@@ -2355,90 +2534,58 @@ function App() {
                 ))}
               </div>
 
-              <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
-                {(
-                  [
-                    ["name", bi("Name", "이름")],
-                    ["date", bi("Date", "날짜")],
-                    ["size", bi("Size", "크기")],
-                  ] as const
-                ).map(([key, label]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => setSortKey(key)}
-                    className={classNames(
-                      "rounded-md border px-2 py-1.5 text-[10px] transition",
-                      sortKey === key
-                        ? "border-white bg-white text-zinc-950"
-                        : "border-zinc-800 bg-zinc-950 text-zinc-300 hover:bg-zinc-900",
-                    )}
-                  >
-                    {label}
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  onClick={() =>
-                    setSortDirection((prev) => (prev === "desc" ? "asc" : "desc"))
-                  }
-                  className="rounded-md border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[10px] text-zinc-300 hover:bg-zinc-900"
-                  title={sortDirection === "desc" ? bi("Descending", "내림차순") : bi("Ascending", "오름차순")}
-                >
-                  {sortDirection === "desc" ? "↓" : "↑"}
-                </button>
-              </div>
             </div>
 
-            <div className="mt-2.5 flex min-h-0 flex-1 flex-col rounded-xl border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-800 dark:bg-zinc-950/60">
+            <div className="mt-1.5 flex min-h-0 flex-1 flex-col rounded-xl border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-800 dark:bg-zinc-950/60">
               <div className="flex shrink-0 items-center justify-between gap-3">
-                <div className="text-[9px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                <div className="text-[8px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
                   {isSearchMode ? bi("Results", "검색 결과") : bi("Explorer", "탐색기")}
                 </div>
-                <div className="text-[9px] text-zinc-500 dark:text-zinc-400">
-                  {isSearchMode ? sortedTreeItems.length : selectedFolderNode?.itemCount ?? 0}
+                <div className="text-[8px] text-zinc-500 dark:text-zinc-400">
+                  {isSearchMode ? sortedTreeItems.length : explorerEntries.length}
                 </div>
               </div>
-              <div ref={explorerRef} className="mt-2 min-h-0 flex-1 overflow-auto">
-                {isSearchMode ? (
-                  <div className="space-y-1">
-                    {sortedTreeItems.map((item) => (
-                      <div key={item.id} data-tree-key={`file:${item.id}`}>
-                        <MediaListRow
-                          item={item}
-                          isActive={
-                            explorerSelection.type === "file" &&
-                            item.id === explorerSelection.id
-                          }
-                          isSelected={selectedItemIds.has(item.id)}
-                          itemHeight={LIST_ITEM_HEIGHT}
-                          onSelect={handleTreeFileSelect}
-                          onContextMenu={handleRowContextMenu}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <FolderTreeBranch
-                    nodePath=""
-                    nodes={folderTree}
-                    selectedPath={
-                      explorerSelection.type === "folder" ? explorerSelection.path : "__none__"
+              <div className="mt-1.5 flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleFolderSelect(parentFolderPath(selectedFolderPath))}
+                  disabled={isSearchMode || !selectedFolderPath}
+                  className="rounded-lg border border-zinc-200 bg-white px-2 py-1 text-[9px] text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200"
+                >
+                  {bi("Up", "상위")}
+                </button>
+                <div className="min-w-0 truncate rounded-lg border border-zinc-200 bg-white px-2.5 py-1 text-[9px] text-zinc-500 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400">
+                  {isSearchMode
+                    ? bi("Search results across the current root", "현재 루트 전체 검색 결과")
+                    : selectedFolderPath || rootFolderName || bi("Root", "루트")}
+                </div>
+              </div>
+              <div ref={explorerRef} className="mt-1.5 min-h-0 flex-1 overflow-auto">
+                <ExplorerTable
+                  entries={explorerEntries}
+                  activeFileId={explorerSelection.type === "file" ? explorerSelection.id : null}
+                  selectedFolderPath={explorerSelection.type === "folder" ? explorerSelection.path : "__none__"}
+                  selectedItemIds={selectedItemIds}
+                  sortKey={sortKey}
+                  sortDirection={sortDirection}
+                  onRequestSort={(key) => {
+                    if (sortKey === key) {
+                      setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+                      return;
                     }
-                    rootLabel={rootFolderName || bi("Root", "루트")}
-                    expandedPaths={expandedFolderPaths}
-                    folderFiles={filesByFolder}
-                    activeFileId={
-                      explorerSelection.type === "file" ? explorerSelection.id : null
-                    }
-                    selectedItemIds={selectedItemIds}
-                    onSelect={handleFolderSelect}
-                    onToggle={toggleFolderExpanded}
-                    onSelectFile={handleTreeFileSelect}
-                    onContextMenuFolder={handleFolderContextMenu}
-                    onContextMenuFile={handleRowContextMenu}
-                  />
-                )}
+                    setSortKey(key);
+                    setSortDirection(key === "date" || key === "size" ? "desc" : "asc");
+                  }}
+                  onToggleFolderExpand={toggleFolderExpand}
+                  onSelectFolder={(path) => {
+                    highlightFolderEntry(path);
+                    selectFolderContents(path);
+                  }}
+                  onOpenFolder={handleFolderSelect}
+                  onSelectFile={handleTreeFileSelect}
+                  onContextMenuFolder={handleFolderContextMenu}
+                  onContextMenuFile={handleRowContextMenu}
+                />
               </div>
             </div>
           </div>
@@ -2476,6 +2623,8 @@ function App() {
                     <div className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[10px] dark:border-zinc-800 dark:bg-zinc-950">
                       {active.kind === "video"
                         ? bi("Video", "영상")
+                        : active.kind === "document"
+                          ? bi("Document", "문서")
                         : active.kind === "zip"
                           ? bi("ZIP Archive", "ZIP 압축파일")
                           : bi("Image", "이미지")}
@@ -2739,6 +2888,34 @@ function App() {
                     {bi("Delete Folder", "폴더 삭제")}
                   </button>
                 ) : null}
+              </>
+            ) : null}
+            {contextMenuFolderPath !== null ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    highlightFolderEntry(contextMenuFolderPath);
+                    selectFolderContents(contextMenuFolderPath);
+                    setContextMenu(null);
+                  }}
+                  className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900"
+                >
+                  {contextMenuFolderPath
+                    ? bi("Select Folder Contents", "폴더 내용 전체 선택")
+                    : bi("Select All", "전체 선택")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearExplorerSelection();
+                    setContextMenu(null);
+                  }}
+                  disabled={selectedItemCount === 0}
+                  className="flex w-full rounded-lg px-3 py-2 text-left text-[12px] hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {bi("Clear Selection", "전체 해제")}
+                </button>
               </>
             ) : null}
             {contextMenuSelectionImages.length >= 1 ? (
@@ -3461,10 +3638,10 @@ function App() {
                     }
                     className="mt-1 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] outline-none focus:border-zinc-600"
                   >
-                    <option value="square_1080">{RESIZE_PRESET_LABELS.square_1080}</option>
-                    <option value="story_1080x1920">{RESIZE_PRESET_LABELS.story_1080x1920}</option>
-                    <option value="landscape_1920x1080">{RESIZE_PRESET_LABELS.landscape_1920x1080}</option>
-                    <option value="thumb_1280x720">{RESIZE_PRESET_LABELS.thumb_1280x720}</option>
+                    <option value="square_1080">{getResizePresetLabel("square_1080")}</option>
+                    <option value="story_1080x1920">{getResizePresetLabel("story_1080x1920")}</option>
+                    <option value="landscape_1920x1080">{getResizePresetLabel("landscape_1920x1080")}</option>
+                    <option value="thumb_1280x720">{getResizePresetLabel("thumb_1280x720")}</option>
                   </select>
                 </label>
               </div>
@@ -3557,6 +3734,8 @@ function App() {
                 <div className="mt-1">
                   {active.kind === "video"
                     ? bi("Video", "영상")
+                    : active.kind === "document"
+                      ? bi("Document", "문서")
                     : active.kind === "zip"
                       ? bi("ZIP Archive", "ZIP 압축파일")
                       : bi("Image", "이미지")}
@@ -3734,6 +3913,13 @@ function App() {
                     </button>
                   </>
                 ) : null}
+                {active.kind === "document" ? (
+                  <div className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-200">
+                    {documentPreviewLoading
+                      ? bi("Loading...", "불러오는 중...")
+                      : bi("Document", "문서")}
+                  </div>
+                ) : null}
                 <button
                   className="rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs hover:bg-zinc-800"
                   type="button"
@@ -3767,6 +3953,14 @@ function App() {
                     />
                   ) : active.kind === "video" ? (
                     renderVideoPreview("bg-black")
+                  ) : active.kind === "document" ? (
+                    <div className="h-full w-full overflow-auto rounded-2xl bg-zinc-950 p-6 text-left text-zinc-100">
+                      <div className="mx-auto w-full max-w-4xl">
+                        <pre className="whitespace-pre-wrap break-words font-mono text-[14px] leading-7">
+                          {documentPreview}
+                        </pre>
+                      </div>
+                    </div>
                   ) : (
                     <div className="flex h-full w-full items-center justify-center rounded-2xl bg-zinc-950 text-center text-sm text-zinc-400">
                       {bi("ZIP archive preview is not available yet.", "ZIP 압축파일 미리보기는 아직 지원되지 않습니다.")}
@@ -3799,6 +3993,7 @@ function App() {
 }
 
 export default App;
+
 
 
 

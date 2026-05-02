@@ -11,6 +11,18 @@ pub fn media_kind_for_extension(ext: &str) -> Option<&'static str> {
         ".jpg" | ".jpeg" | ".png" | ".gif" | ".webp" | ".bmp" | ".svg" | ".avif" => Some("image"),
         ".mp4" | ".mov" | ".m4v" | ".webm" | ".mkv" | ".avi" | ".wmv" => Some("video"),
         ".zip" => Some("zip"),
+        ".md"
+        | ".markdown"
+        | ".txt"
+        | ".csv"
+        | ".json"
+        | ".yaml"
+        | ".yml"
+        | ".xml"
+        | ".log"
+        | ".ini"
+        | ".toml"
+        | ".rst" => Some("document"),
         _ => None,
     }
 }

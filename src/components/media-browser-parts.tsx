@@ -1,8 +1,26 @@
 import { memo, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { classNames, formatBytes } from "../lib/format";
-import { bi } from "../lib/i18n";
-import { compareNaturalText, type FolderTreeNode, type MediaItem } from "../lib/media-browser";
+import { bi, getCurrentLocale } from "../lib/i18n";
 import { assetUrl } from "../lib/tauri-media";
+import type { MediaItem, SortKey } from "../lib/media-browser";
+
+export type ExplorerTableEntry =
+  | {
+      type: "folder";
+      key: string;
+      path: string;
+      name: string;
+      itemCount: number;
+      depth: number;
+      canExpand: boolean;
+      isExpanded: boolean;
+    }
+  | {
+      type: "file";
+      key: string;
+      item: MediaItem;
+      depth: number;
+    };
 
 export const VideoThumb = memo(function VideoThumb({
   path,
@@ -62,316 +80,261 @@ export const VideoThumb = memo(function VideoThumb({
   );
 });
 
-export const MediaListRow = memo(function MediaListRow({
-  item,
-  isActive,
-  isSelected,
-  itemHeight,
-  onSelect,
-  onContextMenu,
-}: {
-  item: MediaItem;
-  isActive: boolean;
-  isSelected: boolean;
-  itemHeight: number;
-  onSelect: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-  onContextMenu: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={(event) => onSelect(event, item)}
-      onContextMenu={(event) => onContextMenu(event, item)}
-      className={classNames(
-        "flex w-full items-center gap-2 rounded-xl border px-2 py-1 text-left transition",
-        isActive
-          ? "border-zinc-950 bg-zinc-950 text-white dark:border-white dark:bg-white dark:text-zinc-950"
-          : isSelected
-            ? "border-sky-700 bg-sky-50 text-zinc-950 dark:border-sky-500 dark:bg-sky-950/40 dark:text-zinc-50"
-            : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 dark:hover:bg-zinc-900",
-      )}
-      style={{ height: `${itemHeight - 4}px` }}
-    >
-      <div className="h-10 w-14 shrink-0 overflow-hidden rounded-lg bg-zinc-200 dark:bg-zinc-800">
-        {item.kind === "image" ? (
-          <img
-            src={assetUrl(item.path)}
-            alt={item.name}
-            className="h-full w-full object-cover"
-            loading="lazy"
-          />
-        ) : item.kind === "video" ? (
-          <VideoThumb path={item.path} active={isActive} />
-        ) : (
-          <div className="flex h-full w-full items-center justify-center text-[10px] font-semibold text-zinc-600 dark:text-zinc-300">
-            ZIP
-          </div>
-        )}
+function entryThumbnail(entry: ExplorerTableEntry, isActive: boolean) {
+  if (entry.type === "folder") {
+    return (
+      <div className="flex h-full w-full items-center justify-center text-[9px] font-semibold text-zinc-600 dark:text-zinc-300">
+        DIR
       </div>
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-[12px] font-semibold leading-5">
-          {item.name}
-          <span
-            className={classNames(
-              "ml-1 text-[10px] font-normal",
-              isActive ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
-            )}
-          >
-            {item.ext}
-          </span>
-        </div>
-        <div
-          className={classNames(
-            "truncate text-[10px]",
-            isActive ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
-          )}
-        >
-          {item.relativePath} / {formatBytes(item.sizeBytes)}
-        </div>
-      </div>
-    </button>
-  );
-});
+    );
+  }
 
-export const FolderTreeBranch = memo(function FolderTreeBranch({
-  nodePath,
-  nodes,
-  selectedPath,
-  rootLabel,
-  expandedPaths,
-  folderFiles,
+  const item = entry.item;
+  if (item.kind === "image") {
+    return (
+      <img
+        src={assetUrl(item.path)}
+        alt={item.name}
+        className="h-full w-full object-cover"
+        loading="lazy"
+      />
+    );
+  }
+  if (item.kind === "video") {
+    return <VideoThumb path={item.path} active={isActive} />;
+  }
+  if (item.kind === "document") {
+    return (
+      <div className="flex h-full w-full items-center justify-center text-[9px] font-semibold text-zinc-600 dark:text-zinc-300">
+        MD
+      </div>
+    );
+  }
+  return (
+    <div className="flex h-full w-full items-center justify-center text-[9px] font-semibold text-zinc-600 dark:text-zinc-300">
+      ZIP
+    </div>
+  );
+}
+
+function entryName(entry: ExplorerTableEntry) {
+  return entry.type === "folder" ? entry.name : `${entry.item.name}${entry.item.ext}`;
+}
+
+function entryMeta(entry: ExplorerTableEntry) {
+  return entry.type === "folder"
+    ? bi(`${entry.itemCount} items`, `${entry.itemCount}개 항목`)
+    : entry.item.ext || "-";
+}
+
+function entryDateParts(entry: ExplorerTableEntry) {
+  if (entry.type === "folder") {
+    return { primary: "-", secondary: "" };
+  }
+
+  const locale = getCurrentLocale() === "ko" ? "ko-KR" : "en-US";
+  const hour12 = getCurrentLocale() === "en";
+  const date = new Date(entry.item.modifiedMs);
+
+  return {
+    primary: new Intl.DateTimeFormat(locale, {
+      year: "2-digit",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(date),
+    secondary: new Intl.DateTimeFormat(locale, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12,
+    }).format(date),
+  };
+}
+
+function entrySize(entry: ExplorerTableEntry) {
+  return entry.type === "folder" ? "-" : formatBytes(entry.item.sizeBytes);
+}
+
+function entryExt(entry: ExplorerTableEntry) {
+  return entry.type === "folder" ? bi("Folder", "폴더") : entry.item.ext || "-";
+}
+
+function sortIndicator(column: SortKey, activeSortKey: SortKey, sortDirection: "asc" | "desc") {
+  if (column !== activeSortKey) return "";
+  return sortDirection === "asc" ? "↑" : "↓";
+}
+
+export const ExplorerTable = memo(function ExplorerTable({
+  entries,
   activeFileId,
+  selectedFolderPath,
   selectedItemIds,
-  onSelect,
-  onToggle,
+  sortKey,
+  sortDirection,
+  onRequestSort,
+  onToggleFolderExpand,
+  onSelectFolder,
+  onOpenFolder,
   onSelectFile,
   onContextMenuFolder,
   onContextMenuFile,
-  hideSelf = false,
-  forceExpanded = false,
 }: {
-  nodePath: string;
-  nodes: Map<string, FolderTreeNode>;
-  selectedPath: string;
-  rootLabel: string;
-  expandedPaths: Set<string>;
-  folderFiles: Map<string, MediaItem[]>;
+  entries: ExplorerTableEntry[];
   activeFileId: string | null;
+  selectedFolderPath: string;
   selectedItemIds: Set<string>;
-  onSelect: (path: string) => void;
-  onToggle: (path: string) => void;
+  sortKey: SortKey;
+  sortDirection: "asc" | "desc";
+  onRequestSort: (key: SortKey) => void;
+  onToggleFolderExpand: (path: string) => void;
+  onSelectFolder: (path: string) => void;
+  onOpenFolder: (path: string) => void;
   onSelectFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
   onContextMenuFolder: (event: ReactMouseEvent<HTMLButtonElement>, path: string) => void;
   onContextMenuFile: (event: ReactMouseEvent<HTMLButtonElement>, item: MediaItem) => void;
-  hideSelf?: boolean;
-  forceExpanded?: boolean;
 }) {
-  const node = nodes.get(nodePath);
-  if (!node) return null;
-
-  const label = node.path ? node.name : rootLabel || bi("Root", "루트");
-  const isSelected = selectedPath === node.path;
-  const files = folderFiles.get(node.path) ?? [];
-  const isExpanded = forceExpanded || expandedPaths.has(node.path);
-  const canExpand = node.children.length > 0 || files.length > 0;
-  const isZipNode = node.path.toLowerCase().endsWith(".zip");
-  const zipBackedChildPaths = new Set(
-    files.filter((file) => file.kind === "zip").map((file) => file.relativePath),
-  );
-  const orderedEntries = [
-    ...files.map((file) => ({ type: "file" as const, key: file.id, name: file.name, file })),
-    ...node.children
-      .filter((childPath) => !zipBackedChildPaths.has(childPath))
-      .map((childPath) => {
-      const childNode = nodes.get(childPath);
-      return {
-        type: "folder" as const,
-        key: childPath,
-        name: childNode?.name ?? childPath,
-        childPath,
-      };
-      }),
-  ].sort((a, b) => compareNaturalText(a.name, b.name));
+  const gridCols = "grid-cols-[minmax(0,1fr)_92px_68px_52px]";
+  const headerCellClass =
+    "flex w-full items-center gap-1 rounded-md px-1 py-0.5 text-left hover:bg-zinc-200/70 dark:hover:bg-zinc-800/70";
 
   return (
-    <div>
-      {!hideSelf ? (
-        <div
-          className={classNames(
-            "flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left transition",
-            isSelected
-              ? "bg-zinc-950 text-white dark:bg-white dark:text-zinc-950"
-              : "hover:bg-zinc-100 dark:hover:bg-zinc-900",
-          )}
-          data-tree-key={`folder:${node.path}`}
-          style={{ paddingLeft: `${10 + node.depth * 12}px` }}
-        >
-          <button
-            type="button"
-            onClick={() => onSelect(node.path)}
-            onContextMenu={(event) => onContextMenuFolder(event, node.path)}
-            className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          >
-            <div className="flex h-6 w-6 shrink-0 items-center justify-center overflow-hidden rounded-md bg-zinc-200 text-[8px] font-semibold text-zinc-500 dark:bg-zinc-800 dark:text-zinc-300">
-              {node.coverPath ? (
-                <img
-                  src={assetUrl(node.coverPath)}
-                  alt={label}
-                  className="h-full w-full object-cover"
-                  loading="lazy"
-                />
-              ) : (
-                isZipNode ? "ZIP" : bi("DIR", "폴더")
-              )}
-            </div>
-            <div className="min-w-0 flex-1 truncate text-[11px] font-medium leading-5">
-              {label}
-            </div>
-            <div
-              className={classNames(
-                "shrink-0 text-[9px]",
-                isSelected ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
-              )}
-            >
-              {node.itemCount}
-            </div>
-          </button>
-          <button
-            type="button"
-            aria-label={isExpanded ? bi("Collapse folder", "폴더 접기") : bi("Expand folder", "폴더 펼치기")}
-            onClick={() => {
-              if (canExpand) onToggle(node.path);
-            }}
+    <div className="overflow-hidden rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-950/50">
+      <div className="max-h-full overflow-auto">
+        <div className="min-w-[420px]">
+          <div
             className={classNames(
-              "flex h-5 w-5 shrink-0 items-center justify-center rounded border text-[10px] font-semibold transition",
-              canExpand
-                ? "border-zinc-700 text-zinc-400 hover:bg-zinc-900 dark:border-zinc-300 dark:text-zinc-600 dark:hover:bg-zinc-200"
-                : "border-transparent text-transparent",
+              "grid items-center gap-2 border-b border-zinc-200 bg-zinc-100/80 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.08em] text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/70 dark:text-zinc-400",
+              gridCols,
             )}
           >
-            {canExpand ? (isExpanded ? "-" : "+") : "+"}
-          </button>
-        </div>
-      ) : null}
+            <button type="button" className={headerCellClass} onClick={() => onRequestSort("name")}>
+              <span>{bi("Name", "이름")}</span>
+              <span>{sortIndicator("name", sortKey, sortDirection)}</span>
+            </button>
+            <button type="button" className={headerCellClass} onClick={() => onRequestSort("date")}>
+              <span>{bi("Date", "날짜")}</span>
+              <span>{sortIndicator("date", sortKey, sortDirection)}</span>
+            </button>
+            <button
+              type="button"
+              className={classNames(headerCellClass, "justify-end")}
+              onClick={() => onRequestSort("size")}
+            >
+              <span>{bi("Size", "크기")}</span>
+              <span>{sortIndicator("size", sortKey, sortDirection)}</span>
+            </button>
+            <button type="button" className={headerCellClass} onClick={() => onRequestSort("ext")}>
+              <span>{bi("Ext", "확장자")}</span>
+              <span>{sortIndicator("ext", sortKey, sortDirection)}</span>
+            </button>
+          </div>
 
-      {isExpanded ? (
-        <>
-          {orderedEntries.map((entry) =>
-            entry.type === "file" ? (
-              <div key={entry.file.id}>
-                <div
-                  className={classNames(
-                    "flex w-full items-center gap-2 rounded-lg px-2 py-0.5 text-left transition",
-                    activeFileId === entry.file.id
-                      ? "bg-zinc-900/90 text-white dark:bg-zinc-100 dark:text-zinc-950"
-                      : selectedItemIds.has(entry.file.id)
-                        ? "bg-zinc-200 text-zinc-950 dark:bg-zinc-800 dark:text-zinc-50"
-                        : "hover:bg-zinc-100 dark:hover:bg-zinc-900",
-                  )}
-                  data-tree-key={`file:${entry.file.id}`}
-                  style={{ paddingLeft: `${28 + node.depth * 12}px` }}
-                >
+          {entries.length ? (
+            entries.map((entry) => {
+              const isFolder = entry.type === "folder";
+              const isActive = !isFolder && activeFileId === entry.item.id;
+              const isSelected =
+                entry.type === "folder"
+                  ? selectedFolderPath === entry.path
+                  : selectedItemIds.has(entry.item.id);
+
+              return (
+                <div key={entry.key} data-tree-key={entry.key}>
                   <button
                     type="button"
-                    onClick={(event) => onSelectFile(event, entry.file)}
-                    onContextMenu={(event) => onContextMenuFile(event, entry.file)}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    onClick={(event) => {
+                      if (entry.type === "folder") {
+                        event.preventDefault();
+                        onSelectFolder(entry.path);
+                        return;
+                      }
+                      onSelectFile(event, entry.item);
+                    }}
+                    onDoubleClick={() => {
+                      if (entry.type === "folder") {
+                        onOpenFolder(entry.path);
+                      }
+                    }}
+                    onContextMenu={(event) => {
+                      if (entry.type === "folder") {
+                        onContextMenuFolder(event, entry.path);
+                        return;
+                      }
+                      onContextMenuFile(event, entry.item);
+                    }}
+                    className={classNames(
+                      "grid w-full items-center gap-2 border-b border-zinc-100 px-2 py-1 text-left transition last:border-b-0 dark:border-zinc-900",
+                      gridCols,
+                      isActive
+                        ? "bg-zinc-950 text-white dark:bg-white dark:text-zinc-950"
+                        : isSelected
+                          ? "bg-sky-50 text-zinc-950 dark:bg-sky-950/30 dark:text-zinc-50"
+                          : "hover:bg-zinc-50 dark:hover:bg-zinc-900/70",
+                    )}
                   >
-                    <div className="flex h-5 w-5 shrink-0 items-center justify-center overflow-hidden rounded border border-zinc-800 bg-zinc-950 text-[8px] font-semibold text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400">
-                      {entry.file.kind === "image" ? (
-                        <img
-                          src={assetUrl(entry.file.path)}
-                          alt={entry.file.name}
-                          className="h-full w-full object-cover"
-                          loading="lazy"
-                        />
-                      ) : entry.file.kind === "video" ? (
-                        "VID"
-                      ) : entry.file.kind === "zip" ? (
-                        "ZIP"
+                    <div className="flex min-w-0 items-center gap-1.5" style={{ paddingLeft: `${entry.depth * 10}px` }}>
+                      {entry.type === "folder" ? (
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            onToggleFolderExpand(entry.path);
+                          }}
+                          className="flex h-4 w-4 shrink-0 items-center justify-center rounded border border-zinc-300 text-[9px] text-zinc-500 hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                          aria-label={entry.isExpanded ? bi("Collapse folder", "폴더 접기") : bi("Expand folder", "폴더 펼치기")}
+                        >
+                          {entry.canExpand ? (entry.isExpanded ? "-" : "+") : ""}
+                        </button>
                       ) : (
-                        "FIL"
+                        <div className="w-4 shrink-0" />
                       )}
+                      <div className="h-7 w-7 shrink-0 overflow-hidden rounded-md bg-zinc-200 dark:bg-zinc-800">
+                        {entryThumbnail(entry, isActive)}
+                      </div>
+                      <div className="min-w-0">
+                        <div
+                          className="overflow-hidden text-[10px] font-semibold leading-3.5"
+                          style={{
+                            display: "-webkit-box",
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: "vertical",
+                            wordBreak: "break-all",
+                          }}
+                        >
+                          {entryName(entry)}
+                        </div>
+                        <div
+                          className={classNames(
+                            "truncate text-[8px] leading-3",
+                            isActive ? "text-zinc-300 dark:text-zinc-600" : "text-zinc-500 dark:text-zinc-400",
+                          )}
+                        >
+                          {entryMeta(entry)}
+                        </div>
+                      </div>
                     </div>
-                    <div className="min-w-0 flex-1 truncate text-[10px]">
-                      {entry.file.name}
-                      <span className="ml-1 text-[9px] text-zinc-500 dark:text-zinc-400">
-                        {entry.file.ext}
-                      </span>
+
+                    <div className="text-[8px] leading-3 text-zinc-500 dark:text-zinc-400">
+                      <div className="truncate">{entryDateParts(entry).primary}</div>
+                      <div className="truncate opacity-80">{entryDateParts(entry).secondary}</div>
+                    </div>
+                    <div className="truncate text-right text-[9px] text-zinc-500 dark:text-zinc-400">
+                      {entrySize(entry)}
+                    </div>
+                    <div className="truncate text-[9px] text-zinc-500 dark:text-zinc-400">
+                      {entryExt(entry)}
                     </div>
                   </button>
-                  {entry.file.kind === "zip" && nodes.has(entry.file.relativePath) ? (
-                    <button
-                      type="button"
-                      aria-label={
-                        expandedPaths.has(entry.file.relativePath)
-                          ? bi("Collapse ZIP", "ZIP 접기")
-                          : bi("Expand ZIP", "ZIP 펼치기")
-                      }
-                      onClick={() => {
-                        if (
-                          folderFiles.get(entry.file.relativePath)?.length ||
-                          nodes.get(entry.file.relativePath)?.children.length
-                        ) {
-                          onToggle(entry.file.relativePath);
-                        }
-                      }}
-                      className={classNames(
-                        "ml-2 flex h-5 w-5 shrink-0 items-center justify-center rounded border text-[10px] font-semibold transition",
-                        folderFiles.get(entry.file.relativePath)?.length ||
-                          nodes.get(entry.file.relativePath)?.children.length
-                          ? "border-zinc-700 text-zinc-400 hover:bg-zinc-900 dark:border-zinc-300 dark:text-zinc-600 dark:hover:bg-zinc-200"
-                          : "border-transparent text-transparent",
-                      )}
-                    >
-                      {expandedPaths.has(entry.file.relativePath) ? "-" : "+"}
-                    </button>
-                  ) : null}
                 </div>
-                {entry.file.kind === "zip" &&
-                nodes.has(entry.file.relativePath) &&
-                expandedPaths.has(entry.file.relativePath) ? (
-                  <FolderTreeBranch
-                    key={`zip-contents:${entry.file.relativePath}`}
-                    nodePath={entry.file.relativePath}
-                    nodes={nodes}
-                    selectedPath={selectedPath}
-                    rootLabel={rootLabel}
-                    expandedPaths={expandedPaths}
-                    folderFiles={folderFiles}
-                    activeFileId={activeFileId}
-                    selectedItemIds={selectedItemIds}
-                    onSelect={onSelect}
-                    onToggle={onToggle}
-                    onSelectFile={onSelectFile}
-                    onContextMenuFolder={onContextMenuFolder}
-                    onContextMenuFile={onContextMenuFile}
-                    hideSelf
-                    forceExpanded
-                  />
-                ) : null}
-              </div>
-            ) : (
-              <FolderTreeBranch
-                key={entry.childPath}
-                nodePath={entry.childPath}
-                nodes={nodes}
-                selectedPath={selectedPath}
-                rootLabel={rootLabel}
-                expandedPaths={expandedPaths}
-                folderFiles={folderFiles}
-                activeFileId={activeFileId}
-                selectedItemIds={selectedItemIds}
-                onSelect={onSelect}
-                onToggle={onToggle}
-                onSelectFile={onSelectFile}
-                onContextMenuFolder={onContextMenuFolder}
-                onContextMenuFile={onContextMenuFile}
-              />
-            ),
+              );
+            })
+          ) : (
+            <div className="px-3 py-6 text-center text-[11px] text-zinc-500 dark:text-zinc-400">
+              {bi("No items in this folder.", "이 폴더에 항목이 없습니다.")}
+            </div>
           )}
-        </>
-      ) : null}
+        </div>
+      </div>
     </div>
   );
 });

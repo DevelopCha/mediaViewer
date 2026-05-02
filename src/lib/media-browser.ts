@@ -1,5 +1,5 @@
-export type MediaKind = "image" | "video" | "zip";
-export type SortKey = "name" | "date" | "size";
+export type MediaKind = "image" | "video" | "zip" | "document";
+export type SortKey = "name" | "date" | "size" | "ext";
 
 export type TreeVisibleEntry =
   | {
@@ -72,18 +72,30 @@ export function compareNaturalText(a: string, b: string) {
   return NATURAL_NAME_COLLATOR.compare(a, b);
 }
 
-export function sortMediaItems(items: MediaItem[], sortKey: SortKey) {
+export function sortMediaItems(
+  items: MediaItem[],
+  sortKey: SortKey,
+  sortDirection: "asc" | "desc" = "asc",
+) {
   const next = [...items];
   next.sort((a, b) => {
+    let result = 0;
     switch (sortKey) {
       case "name":
-        return compareNaturalText(a.name, b.name) || compareNaturalText(a.ext, b.ext);
+        result = compareNaturalText(a.name, b.name) || compareNaturalText(a.ext, b.ext);
+        break;
+      case "ext":
+        result = compareNaturalText(a.ext, b.ext) || compareNaturalText(a.name, b.name);
+        break;
       case "size":
-        return b.sizeBytes - a.sizeBytes;
+        result = a.sizeBytes - b.sizeBytes;
+        break;
       case "date":
       default:
-        return b.modifiedMs - a.modifiedMs;
+        result = a.modifiedMs - b.modifiedMs;
+        break;
     }
+    return sortDirection === "desc" ? -result : result;
   });
   return next;
 }
@@ -92,7 +104,7 @@ export function filterMediaItems(
   items: MediaItem[],
   options: {
     folderPath?: string;
-    kindFilter: "all" | MediaKind;
+    kindFilter: Set<MediaKind>;
     query: string;
     includeArchiveEntries?: boolean;
   },
@@ -109,7 +121,7 @@ export function filterMediaItems(
     if (folderPrefix && !item.relativePath.startsWith(folderPrefix)) {
       continue;
     }
-    if (options.kindFilter !== "all" && item.kind !== options.kindFilter) {
+    if (!options.kindFilter.has(item.kind)) {
       continue;
     }
     if (normalizedQuery) {

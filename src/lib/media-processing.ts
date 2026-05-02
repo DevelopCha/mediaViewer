@@ -45,24 +45,24 @@ export type BackgroundTask = {
 
 export const BACKGROUND_ENGINES: Array<{
   key: BackgroundEngineKey;
-  label: string;
+  readonly label: string;
 }> = [
-  { key: "anime", label: bi("ISNet Anime (Anime)", "ISNet 애니메 (애니)") },
-  { key: "real", label: bi("ISNet General (Real)", "ISNet 일반형 (실사)") },
-  { key: "bria", label: bi("BRIA RMBG (Real)", "BRIA RMBG (실사)") },
-  { key: "withoutbg", label: bi("withoutBG (HQ)", "withoutBG (고품질)") },
+  { key: "anime", get label() { return bi("ISNet Anime (Anime)", "ISNet 애니메 (애니)"); } },
+  { key: "real", get label() { return bi("ISNet General (Real)", "ISNet 일반형 (실사)"); } },
+  { key: "bria", get label() { return bi("BRIA RMBG (Real)", "BRIA RMBG (실사)"); } },
+  { key: "withoutbg", get label() { return bi("withoutBG (HQ)", "withoutBG (고품질)"); } },
 ];
 
 export const FRAME_EXTRACT_PRESETS: Array<{
   key: FrameExtractPresetKey;
-  label: string;
+  readonly label: string;
 }> = [
-  { key: "summary_12", label: bi("Summary 12 Frames", "요약 12프레임") },
-  { key: "summary_24", label: bi("Summary 24 Frames", "요약 24프레임") },
-  { key: "summary_60", label: bi("Summary 60 Frames", "요약 60프레임") },
-  { key: "fps_30", label: bi("Animation Extract 30 FPS", "애니메이션 추출 30 FPS") },
-  { key: "fps_45", label: bi("Animation Extract 45 FPS", "애니메이션 추출 45 FPS") },
-  { key: "fps_60", label: bi("Animation Extract 60 FPS", "애니메이션 추출 60 FPS") },
+  { key: "summary_12", get label() { return bi("Summary 12 Frames", "요약 12프레임"); } },
+  { key: "summary_24", get label() { return bi("Summary 24 Frames", "요약 24프레임"); } },
+  { key: "summary_60", get label() { return bi("Summary 60 Frames", "요약 60프레임"); } },
+  { key: "fps_30", get label() { return bi("Animation Extract 30 FPS", "애니메이션 추출 30 FPS"); } },
+  { key: "fps_45", get label() { return bi("Animation Extract 45 FPS", "애니메이션 추출 45 FPS"); } },
+  { key: "fps_60", get label() { return bi("Animation Extract 60 FPS", "애니메이션 추출 60 FPS"); } },
 ];
 
 export function resolveVideoVrLayout(
