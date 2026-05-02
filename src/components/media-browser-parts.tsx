@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { classNames, formatBytes } from "../lib/format";
+import { bi } from "../lib/i18n";
 import { compareNaturalText, type FolderTreeNode, type MediaItem } from "../lib/media-browser";
 import { assetUrl } from "../lib/tauri-media";
 
@@ -168,7 +169,7 @@ export const FolderTreeBranch = memo(function FolderTreeBranch({
   const node = nodes.get(nodePath);
   if (!node) return null;
 
-  const label = node.path ? node.name : rootLabel || "Root";
+  const label = node.path ? node.name : rootLabel || bi("Root", "루트");
   const isSelected = selectedPath === node.path;
   const files = folderFiles.get(node.path) ?? [];
   const isExpanded = forceExpanded || expandedPaths.has(node.path);
@@ -220,7 +221,7 @@ export const FolderTreeBranch = memo(function FolderTreeBranch({
                   loading="lazy"
                 />
               ) : (
-                isZipNode ? "ZIP" : "DIR"
+                isZipNode ? "ZIP" : bi("DIR", "폴더")
               )}
             </div>
             <div className="min-w-0 flex-1 truncate text-[11px] font-medium leading-5">
@@ -237,7 +238,7 @@ export const FolderTreeBranch = memo(function FolderTreeBranch({
           </button>
           <button
             type="button"
-            aria-label={isExpanded ? "Collapse folder" : "Expand folder"}
+            aria-label={isExpanded ? bi("Collapse folder", "폴더 접기") : bi("Expand folder", "폴더 펼치기")}
             onClick={() => {
               if (canExpand) onToggle(node.path);
             }}
@@ -303,7 +304,9 @@ export const FolderTreeBranch = memo(function FolderTreeBranch({
                     <button
                       type="button"
                       aria-label={
-                        expandedPaths.has(entry.file.relativePath) ? "Collapse ZIP" : "Expand ZIP"
+                        expandedPaths.has(entry.file.relativePath)
+                          ? bi("Collapse ZIP", "ZIP 접기")
+                          : bi("Expand ZIP", "ZIP 펼치기")
                       }
                       onClick={() => {
                         if (

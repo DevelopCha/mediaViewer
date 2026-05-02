@@ -1,4 +1,5 @@
 import type { CSSProperties } from "react";
+import { bi } from "./i18n";
 
 export type BackgroundTaskStatus = "queued" | "running" | "completed" | "failed";
 export type BackgroundEngineKey = "anime" | "real" | "bria" | "withoutbg";
@@ -46,22 +47,22 @@ export const BACKGROUND_ENGINES: Array<{
   key: BackgroundEngineKey;
   label: string;
 }> = [
-  { key: "anime", label: "ISNet Anime (Anime)" },
-  { key: "real", label: "ISNet General (Real)" },
-  { key: "bria", label: "BRIA RMBG (Real)" },
-  { key: "withoutbg", label: "withoutBG (HQ)" },
+  { key: "anime", label: bi("ISNet Anime (Anime)", "ISNet 애니메 (애니)") },
+  { key: "real", label: bi("ISNet General (Real)", "ISNet 일반형 (실사)") },
+  { key: "bria", label: bi("BRIA RMBG (Real)", "BRIA RMBG (실사)") },
+  { key: "withoutbg", label: bi("withoutBG (HQ)", "withoutBG (고품질)") },
 ];
 
 export const FRAME_EXTRACT_PRESETS: Array<{
   key: FrameExtractPresetKey;
   label: string;
 }> = [
-  { key: "summary_12", label: "Summary 12 Frames" },
-  { key: "summary_24", label: "Summary 24 Frames" },
-  { key: "summary_60", label: "Summary 60 Frames" },
-  { key: "fps_30", label: "Animation Extract 30 FPS" },
-  { key: "fps_45", label: "Animation Extract 45 FPS" },
-  { key: "fps_60", label: "Animation Extract 60 FPS" },
+  { key: "summary_12", label: bi("Summary 12 Frames", "요약 12프레임") },
+  { key: "summary_24", label: bi("Summary 24 Frames", "요약 24프레임") },
+  { key: "summary_60", label: bi("Summary 60 Frames", "요약 60프레임") },
+  { key: "fps_30", label: bi("Animation Extract 30 FPS", "애니메이션 추출 30 FPS") },
+  { key: "fps_45", label: bi("Animation Extract 45 FPS", "애니메이션 추출 45 FPS") },
+  { key: "fps_60", label: bi("Animation Extract 60 FPS", "애니메이션 추출 60 FPS") },
 ];
 
 export function resolveVideoVrLayout(
@@ -128,13 +129,13 @@ export function upsertBackgroundTask(tasks: BackgroundTask[], task: BackgroundTa
 export function backgroundTaskLabel(status: BackgroundTaskStatus) {
   switch (status) {
     case "queued":
-      return "Queued";
+      return bi("Queued", "대기 중");
     case "running":
-      return "Running";
+      return bi("Running", "실행 중");
     case "completed":
-      return "Completed";
+      return bi("Completed", "완료");
     case "failed":
-      return "Failed";
+      return bi("Failed", "실패");
     default:
       return status;
   }
@@ -142,13 +143,13 @@ export function backgroundTaskLabel(status: BackgroundTaskStatus) {
 
 export function backgroundTaskProgressLabel(task: BackgroundTask) {
   if (task.status === "queued") {
-    return "Waiting";
+    return bi("Waiting", "대기");
   }
   if (task.status === "running") {
     return `${Math.max(1, task.progress)}%`;
   }
   if (task.status === "failed") {
-    return "Failed";
+    return bi("Failed", "실패");
   }
   return `${task.progress}%`;
 }
